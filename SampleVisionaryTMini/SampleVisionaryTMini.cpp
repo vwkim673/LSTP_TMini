@@ -131,14 +131,16 @@
 #include "DataStack.h"
 //#include "VA.h"
 
+#include <NvInferPlugin.h>
 #include "YOLO11.hpp"
+#include "TrtRunner.h"
 
-#include "inference.h"
 
 #pragma comment(lib, "Dbghelp.lib")
 #include <DbgHelp.h>
 
-#include <zstd.h>
+
+//#include <zstd.h>
 
 #define DEFAULT_RECVLEN 50
 #define DEFAULT_SENDLEN 50
@@ -4829,10 +4831,11 @@ auto tmini_data_stream() -> void
 			logMessage("Data Acquisition Stopped");
 
 		if (tmini_data_stream_flag) logMessage("Data Streaming Ready & Starting!");
+		int frameIndex = 0;
 		while (tmini_data_stream_flag)
 		{
 			auto waitDur_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now() - last_frame_get_time).count();
-			if (waitDur_ms > 100)
+			if (waitDur_ms > 170)
 			{
 				blnGetNewFrame = false;
 				bool stepComplete = visionaryControl.stepAcquisition();
@@ -4850,6 +4853,9 @@ auto tmini_data_stream() -> void
 						{
 							//-----------------------------------------------
 							// Convert data to a point cloud
+
+							//writeFrame(visionary::VisionaryType::eVisionaryTMini, *pDataHandler, "TestFile" + std::to_string(frameIndex));
+
 							std::vector<PointXYZ> pointCloud;
 							pDataHandler->generatePointCloud(pointCloud);
 							pDataHandler->transformPointCloud(pointCloud);
@@ -8721,6 +8727,167 @@ static std::wstring Utf8ToWstring(const std::string& s) {
 
 struct Detection2 { cv::Rect box; int cls; float score; };
 
+struct LetterboxInfo {
+	float scale = 1.f;
+	int pad_x = 0;
+	int pad_y = 0;
+	int new_w = 0;
+	int new_h = 0;
+};
+
+// Letterbox to (dst_w, dst_h), pads with 114 like YOLO
+static cv::Mat letterbox(const cv::Mat& src, int dst_w, int dst_h, LetterboxInfo& info) {
+	int src_w = src.cols, src_h = src.rows;
+	float r = std::min((float)dst_w / src_w, (float)dst_h / src_h);
+
+	info.scale = r;
+	info.new_w = (int)std::round(src_w * r);
+	info.new_h = (int)std::round(src_h * r);
+
+	cv::Mat resized;
+	cv::resize(src, resized, cv::Size(info.new_w, info.new_h), 0, 0, cv::INTER_LINEAR);
+
+	int pad_w = dst_w - info.new_w;
+	int pad_h = dst_h - info.new_h;
+
+	info.pad_x = pad_w / 2;
+	info.pad_y = pad_h / 2;
+
+	cv::Mat out(dst_h, dst_w, src.type(), cv::Scalar(114, 114, 114));
+	resized.copyTo(out(cv::Rect(info.pad_x, info.pad_y, info.new_w, info.new_h)));
+	return out;
+}
+
+// BGR cv::Mat -> RGB float32 NCHW normalized
+static void matToCHW(const cv::Mat& img_bgr_letterboxed, std::vector<float>& chw) {
+	cv::Mat rgb;
+	cv::cvtColor(img_bgr_letterboxed, rgb, cv::COLOR_BGR2RGB);
+
+	cv::Mat f;
+	rgb.convertTo(f, CV_32F, 1.0 / 255.0);
+
+	int H = f.rows, W = f.cols;
+	chw.resize(3ull * H * W);
+
+	// HWC -> CHW
+	for (int y = 0; y < H; ++y) {
+		const cv::Vec3f* row = f.ptr<cv::Vec3f>(y);
+		for (int x = 0; x < W; ++x) {
+			const cv::Vec3f& p = row[x]; // RGB
+			chw[0ull * H * W + (size_t)y * W + x] = p[0];
+			chw[1ull * H * W + (size_t)y * W + x] = p[1];
+			chw[2ull * H * W + (size_t)y * W + x] = p[2];
+		}
+	}
+}
+
+struct RectInfo {
+	cv::Rect2f box;   // x,y,w,h in original image coords
+	int class_id = -1;
+	float score = 0.f;
+};
+
+static float IoU(const cv::Rect2f& a, const cv::Rect2f& b) {
+	float interArea = (a & b).area();
+	float unionArea = a.area() + b.area() - interArea;
+	return unionArea > 0.f ? interArea / unionArea : 0.f;
+}
+
+static std::vector<RectInfo> nms(const std::vector<RectInfo>& dets, float iouThresh) {
+	std::vector<int> idx(dets.size());
+	std::iota(idx.begin(), idx.end(), 0);
+
+	std::sort(idx.begin(), idx.end(), [&](int i, int j) {
+		return dets[i].score > dets[j].score;
+		});
+
+	std::vector<RectInfo> out;
+	std::vector<bool> suppressed(dets.size(), false);
+
+	for (size_t _i = 0; _i < idx.size(); ++_i) {
+		int i = idx[_i];
+		if (suppressed[i]) continue;
+		out.push_back(dets[i]);
+
+		for (size_t _j = _i + 1; _j < idx.size(); ++_j) {
+			int j = idx[_j];
+			if (suppressed[j]) continue;
+
+			// class-aware NMS (usually desired for YOLO)
+			if (dets[i].class_id != dets[j].class_id) continue;
+
+			if (IoU(dets[i].box, dets[j].box) > iouThresh) {
+				suppressed[j] = true;
+			}
+		}
+	}
+	return out;
+}
+
+static std::vector<RectInfo> decodeYoloV8_1xCxN(
+	const float* out,          // float pointer to output0
+	int C, int N,              // C=8, N=8400
+	int numClasses,            // 4 in your case
+	float confThresh,
+	const LetterboxInfo& lb,
+	int origW, int origH
+) {
+	std::vector<RectInfo> dets;
+	dets.reserve(256);
+
+	// out is arranged as [C, N] for your dims [1,C,N]
+	// index: out[c*N + i]
+	for (int i = 0; i < N; ++i) {
+		float x = out[0 * N + i];
+		float y = out[1 * N + i];
+		float w = out[2 * N + i];
+		float h = out[3 * N + i];
+
+		// class score = max over classes
+		int bestCls = -1;
+		float bestScore = 0.f;
+		for (int c = 0; c < numClasses; ++c) {
+			float s = out[(4 + c) * N + i];
+			if (s > bestScore) {
+				bestScore = s;
+				bestCls = c;
+			}
+		}
+
+		if (bestScore < confThresh) continue;
+
+		// xywh -> x1y1x2y2 in letterboxed input coords
+		float x1 = x - w * 0.5f;
+		float y1 = y - h * 0.5f;
+		float x2 = x + w * 0.5f;
+		float y2 = y + h * 0.5f;
+
+		// Undo letterbox: (coord - pad) / scale
+		x1 = (x1 - lb.pad_x) / lb.scale;
+		y1 = (y1 - lb.pad_y) / lb.scale;
+		x2 = (x2 - lb.pad_x) / lb.scale;
+		y2 = (y2 - lb.pad_y) / lb.scale;
+
+		// Clip to original image
+		x1 = std::max(0.f, std::min(x1, (float)(origW - 1)));
+		y1 = std::max(0.f, std::min(y1, (float)(origH - 1)));
+		x2 = std::max(0.f, std::min(x2, (float)(origW - 1)));
+		y2 = std::max(0.f, std::min(y2, (float)(origH - 1)));
+
+		float bw = x2 - x1;
+		float bh = y2 - y1;
+		if (bw <= 1.f || bh <= 1.f) continue;
+
+		RectInfo d;
+		d.box = cv::Rect2f(x1, y1, bw, bh);
+		d.class_id = bestCls;
+		d.score = bestScore;
+		dets.push_back(d);
+	}
+
+	return dets;
+}
+
 namespace fs = std::filesystem;
 std::string getParent(const std::string& pathStr) {
 	fs::path p(pathStr);
@@ -8765,6 +8932,80 @@ int main(int argc, char* argv[])
 	parseINI(app_path);
 	parseProcessINI(app_path);
 	parseIPINI(app_path);
+
+	try {
+		TrtRunner trt;
+
+		if (!trt.loadEngine("yolov8_fp16_LSTP_TMini.engine")) {
+			printf("loadEngine failed\n");	
+		}
+
+		std::string imagePath = app_path + "/sample.jpg";
+		cv::Mat frame = cv::imread(imagePath);
+
+		LetterboxInfo lb;
+		cv::Mat in = letterbox(frame, 640, 640, lb);
+
+		std::vector<float> inputCHW;
+		matToCHW(in, inputCHW);
+
+		size_t inputBytes = inputCHW.size() * sizeof(float);
+
+		if (!trt.infer("images", inputCHW.data(), inputBytes)) {
+			printf("infer failed\n");
+			return 1;
+		}
+
+		auto outs = trt.outputs();
+		printf("Got %zu output tensors\n", outs.size());
+		for (auto& o : outs) {
+			printf("Output %s bytes=%zu dims=[", o.name.c_str(), o.bytes);
+			for (int i = 0; i < o.dims.nbDims; i++) printf("%d%s", o.dims.d[i], (i + 1 < o.dims.nbDims ? "," : ""));
+			printf("]\n");
+		}
+
+		const auto& out0 = outs.at(0);
+
+		// out0.host is bytes; convert to float pointer
+		const float* pred = reinterpret_cast<const float*>(out0.host.data());
+
+		// dims: [1,8,8400]
+		int C = out0.dims.d[1];   // 8
+		int N = out0.dims.d[2];   // 8400
+		int numClasses = C - 4;   // 4
+
+		float confThresh = 0.25f;
+		float iouThresh = 0.45f;
+
+		std::vector<RectInfo> dets = decodeYoloV8_1xCxN(
+			pred, C, N, numClasses, confThresh,
+			lb, frame.cols, frame.rows
+		);
+
+		std::vector<RectInfo> finalDets = nms(dets, iouThresh);
+
+		// Draw
+		for (const auto& d : finalDets) {
+			cv::rectangle(frame, d.box, cv::Scalar(0, 255, 0), 2);
+			char txt[64];
+			sprintf_s(txt, "cls=%d %.2f", d.class_id, d.score);
+			cv::putText(frame, txt, cv::Point((int)d.box.x, (int)d.box.y - 5),
+				cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(0, 255, 0), 2);
+		}
+		cv::imshow("test", frame);
+		cv::waitKey(0);
+
+
+
+	}
+	catch (const std::exception& e) {
+		printf("EXCEPTION: %s\n", e.what());
+		return 1;
+	}
+	catch (...) {
+		printf("UNKNOWN EXCEPTION\n");
+		return 1;
+	}
 
 	//YOLOv11
 	bool useGPU = true;

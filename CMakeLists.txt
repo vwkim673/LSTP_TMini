@@ -45,3 +45,6 @@ target_link_libraries(SampleVisionaryTVGA sick_visionary_cpp_shared)
 add_executable(SampleVisionaryTMini SampleVisionaryTMini/SampleVisionaryTMini.cpp)
 target_link_libraries(SampleVisionaryTMini sick_visionary_cpp_shared)
 
+
+
+
