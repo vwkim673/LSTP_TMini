@@ -8995,8 +8995,6 @@ int main(int argc, char* argv[])
 		cv::imshow("test", frame);
 		cv::waitKey(0);
 
-
-
 	}
 	catch (const std::exception& e) {
 		printf("EXCEPTION: %s\n", e.what());
