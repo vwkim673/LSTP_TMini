@@ -29,18 +29,6 @@ endif()
 ### BUILD ###
 add_subdirectory(sick_visionary_cpp_shared)
 
-## Visionary-S sample ##
-add_executable(SampleVisionaryS SampleVisionaryS/SampleVisionaryS.cpp)
-target_link_libraries(SampleVisionaryS sick_visionary_cpp_shared)
-
-## Visionary-T sample ##
-add_executable(SampleVisionaryT SampleVisionaryT/SampleVisionaryT.cpp)
-target_link_libraries(SampleVisionaryT sick_visionary_cpp_shared)
-
-## Visionary-T VGA samples ##
-add_executable(SampleVisionaryTVGA SampleVisionaryTVGA/SampleVisionaryTVGA.cpp)
-target_link_libraries(SampleVisionaryTVGA sick_visionary_cpp_shared)
-
 ## Visionary-T Mini samples ##
 add_executable(SampleVisionaryTMini SampleVisionaryTMini/SampleVisionaryTMini.cpp)
 target_link_libraries(SampleVisionaryTMini sick_visionary_cpp_shared)

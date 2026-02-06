@@ -133,12 +133,8 @@
 
 #include "YOLO11.hpp"
 
-#include "inference.h"
-
 #pragma comment(lib, "Dbghelp.lib")
 #include <DbgHelp.h>
-
-#include <zstd.h>
 
 #define DEFAULT_RECVLEN 50
 #define DEFAULT_SENDLEN 50
@@ -1374,261 +1370,6 @@ void parseIPINI(string path)
 	{
 		logMessage("Failed to read INI/IP_LIST.ini file");
 	}
-}
-
-static void write_all(std::ofstream& os, const void* p, size_t n) {
-	os.write(reinterpret_cast<const char*>(p), static_cast<std::streamsize>(n));
-	if (!os) throw std::runtime_error("write failed");
-}
-
-static void read_all(std::ifstream& is, void* p, size_t n) {
-	is.read(reinterpret_cast<char*>(p), static_cast<std::streamsize>(n));
-	if (!is) throw std::runtime_error("read failed");
-}
-static FILE* fopen_bin_write(const std::string& path) {
-#ifdef _MSC_VER
-	FILE* f = nullptr;
-	if (fopen_s(&f, path.c_str(), "wb") != 0) return nullptr;
-	return f;
-#else
-	return std::fopen(path.c_str(), "wb");
-#endif
-}
-
-static FILE* fopen_bin_read(const std::string& path) {
-#ifdef _MSC_VER
-	FILE* f = nullptr;
-	if (fopen_s(&f, path.c_str(), "rb") != 0) return nullptr;
-	return f;
-#else
-	return std::fopen(path.c_str(), "rb");
-#endif
-}
-
-// ---- SAVE: PointCloud<PointT> -> (PCD binary_compressed in memory) -> zstd -> file
-template <typename PointT>
-void save_cloud_pcd_compressed_zstd(const std::string& path,
-	const pcl::PointCloud<PointT>& cloud,
-	int zstd_level = 9)
-{
-	// 1) Convert to PCLPointCloud2 (so writer ostream overload is available)
-	pcl::PCLPointCloud2 cloud2;
-	pcl::toPCLPointCloud2(cloud, cloud2);
-
-	// 2) Write PCD "binary_compressed" to an in-memory stream
-	std::ostringstream oss(std::ios::binary);
-	pcl::PCDWriter writer;
-	int rc = writer.writeBinaryCompressed(oss, cloud2);
-	if (rc < 0) throw std::runtime_error("PCDWriter::writeBinaryCompressed failed");
-
-	const std::string pcd_bytes_str = oss.str();
-	const size_t pcd_bytes = pcd_bytes_str.size();
-
-	// 3) zstd compress those bytes
-	const size_t bound = ZSTD_compressBound(pcd_bytes);
-	std::vector<uint8_t> zbuf(bound);
-
-	size_t zsize = ZSTD_compress(zbuf.data(), bound,
-		pcd_bytes_str.data(), pcd_bytes,
-		zstd_level);
-	if (ZSTD_isError(zsize))
-		throw std::runtime_error(std::string("ZSTD_compress error: ") + ZSTD_getErrorName(zsize));
-
-	// 4) Write our container file
-	std::ofstream out(path, std::ios::binary);
-	if (!out) throw std::runtime_error("cannot open for write: " + path);
-
-	const char magic[4] = { 'P','C','D','Z' };
-	uint64_t raw_size64 = static_cast<uint64_t>(pcd_bytes);
-	uint32_t zsize32 = static_cast<uint32_t>(zsize);
-
-	write_all(out, magic, 4);
-	write_all(out, &raw_size64, sizeof(raw_size64));
-	write_all(out, &zsize32, sizeof(zsize32));
-	write_all(out, zbuf.data(), zsize);
-}
-
-// ---- LOAD: file -> zstd -> PCD bytes in memory -> PCDReader -> PointCloud<PointT>
-template <typename PointT>
-pcl::PointCloud<PointT> load_cloud_pcd_compressed_zstd(const std::string& path)
-{
-	// 1) Read container file
-	std::ifstream in(path, std::ios::binary);
-	if (!in) throw std::runtime_error("cannot open for read: " + path);
-
-	char magic[4];
-	read_all(in, magic, 4);
-	if (std::memcmp(magic, "PCDZ", 4) != 0)
-		throw std::runtime_error("bad magic (not PCDZ)");
-
-	uint64_t raw_pcd_bytes = 0;
-	uint32_t zstd_bytes = 0;
-	read_all(in, &raw_pcd_bytes, sizeof(raw_pcd_bytes));
-	read_all(in, &zstd_bytes, sizeof(zstd_bytes));
-
-	std::vector<uint8_t> zbuf(zstd_bytes);
-	read_all(in, zbuf.data(), zbuf.size());
-
-	// 2) Decompress to PCD-bytes buffer
-	std::vector<uint8_t> pcd_buf(static_cast<size_t>(raw_pcd_bytes));
-	size_t dsize = ZSTD_decompress(pcd_buf.data(), pcd_buf.size(), zbuf.data(), zbuf.size());
-	if (ZSTD_isError(dsize))
-		throw std::runtime_error(std::string("ZSTD_decompress error: ") + ZSTD_getErrorName(dsize));
-	if (dsize != pcd_buf.size())
-		throw std::runtime_error("decompressed size mismatch");
-
-	// 3) Parse PCD from memory using PCDReader
-	pcl::PCDReader reader;
-	pcl::PCLPointCloud2 cloud2;
-	Eigen::Vector4f origin;
-	Eigen::Quaternionf orientation;
-	int pcd_version = 0, data_type = 0;
-	unsigned int data_idx = 0;
-
-	// readHeader wants an istream opened as binary; istringstream over bytes works
-	std::string pcd_str(reinterpret_cast<const char*>(pcd_buf.data()), pcd_buf.size());
-	std::istringstream iss(pcd_str, std::ios::binary);
-
-	int hr = reader.readHeader(iss, cloud2, origin, orientation, pcd_version, data_type, data_idx);
-	if (hr < 0) throw std::runtime_error("PCDReader::readHeader(stream) failed");
-
-	// data_type: 0=ASCII, 1=Binary, 2=Binary compressed (per docs) :contentReference[oaicite:2]{index=2}
-	if (data_type == 0) {
-		// ASCII body is read from stream; seek to data_idx first
-		iss.clear();
-		iss.seekg(static_cast<std::streamoff>(data_idx), std::ios::beg);
-		int br = reader.readBodyASCII(iss, cloud2, pcd_version);
-		if (br < 0) throw std::runtime_error("readBodyASCII failed");
-	}
-	else {
-		// Binary or binary_compressed body can be read from the in-memory block
-		bool compressed = (data_type == 2);
-		int br = reader.readBodyBinary(pcd_buf.data(), cloud2, pcd_version, compressed, data_idx);
-		if (br < 0) throw std::runtime_error("readBodyBinary failed");
-	}
-
-	// 4) Convert back to templated PointCloud
-	pcl::PointCloud<PointT> out;
-	pcl::fromPCLPointCloud2(cloud2, out);
-	out.sensor_origin_ = origin;
-	out.sensor_orientation_ = orientation;
-	return out;
-}
-
-template <typename PointT>
-void save_cloud_pcd_binary_zstd(const std::string& path,
-	const pcl::PointCloud<PointT>& cloud,
-	int zstd_level = 9)
-{
-	// 1) Convert to PCLPointCloud2
-	pcl::PCLPointCloud2 cloud2;
-	pcl::toPCLPointCloud2(cloud, cloud2);
-
-	pcl::PCDWriter writer;
-
-	// 2) Build PCD binary stream in memory
-	std::ostringstream oss(std::ios::binary);
-
-	// Header
-	std::string header = writer.generateHeaderBinary(
-		cloud2,
-		cloud.sensor_origin_,
-		cloud.sensor_orientation_
-	);
-	oss.write(header.data(), header.size());
-
-	// Body (THIS is the key line)
-	oss.write(reinterpret_cast<const char*>(cloud2.data.data()),
-		cloud2.data.size());
-
-	const std::string pcd_bytes = oss.str();
-
-	// 3) zstd compress
-	size_t bound = ZSTD_compressBound(pcd_bytes.size());
-	std::vector<uint8_t> zbuf(bound);
-
-	size_t zsize = ZSTD_compress(
-		zbuf.data(), bound,
-		pcd_bytes.data(), pcd_bytes.size(),
-		zstd_level
-	);
-	if (ZSTD_isError(zsize))
-		throw std::runtime_error(ZSTD_getErrorName(zsize));
-
-	// 4) Write container
-	std::ofstream out(path, std::ios::binary);
-	if (!out) throw std::runtime_error("open failed");
-
-	const char magic[4] = { 'P','C','D','Z' };
-	uint64_t raw_size = pcd_bytes.size();
-	uint32_t zsize32 = static_cast<uint32_t>(zsize);
-
-	out.write(magic, 4);
-	out.write(reinterpret_cast<char*>(&raw_size), sizeof(raw_size));
-	out.write(reinterpret_cast<char*>(&zsize32), sizeof(zsize32));
-	out.write(reinterpret_cast<char*>(zbuf.data()), zsize);
-}
-
-template <typename PointT>
-pcl::PointCloud<PointT> load_cloud_pcd_binary_zstd(const std::string& path)
-{
-	std::ifstream in(path, std::ios::binary);
-	if (!in) throw std::runtime_error("open failed");
-
-	char magic[4];
-	in.read(magic, 4);
-	if (std::memcmp(magic, "PCDZ", 4) != 0)
-		throw std::runtime_error("bad magic");
-
-	uint64_t raw_size;
-	uint32_t zsize;
-	in.read(reinterpret_cast<char*>(&raw_size), sizeof(raw_size));
-	in.read(reinterpret_cast<char*>(&zsize), sizeof(zsize));
-
-	std::vector<uint8_t> zbuf(zsize);
-	in.read(reinterpret_cast<char*>(zbuf.data()), zbuf.size());
-
-	// zstd decompress
-	std::vector<uint8_t> pcd(raw_size);
-	size_t dsize = ZSTD_decompress(
-		pcd.data(), pcd.size(),
-		zbuf.data(), zbuf.size()
-	);
-	if (ZSTD_isError(dsize))
-		throw std::runtime_error(ZSTD_getErrorName(dsize));
-
-	// Parse PCD from memory
-	pcl::PCDReader reader;
-	pcl::PCLPointCloud2 cloud2;
-	Eigen::Vector4f origin;
-	Eigen::Quaternionf orientation;
-	int version = 0, data_type = 0;
-	unsigned int data_idx = 0;
-
-	std::istringstream iss(
-		std::string(reinterpret_cast<char*>(pcd.data()), pcd.size()),
-		std::ios::binary
-	);
-
-	reader.readHeader(iss, cloud2, origin, orientation,
-		version, data_type, data_idx);
-
-	// data_type: 0=ASCII, 1=BINARY, 2=BINARY_COMPRESSED
-	if (data_type != 1)
-		throw std::runtime_error("unexpected PCD data type");
-
-	reader.readBodyBinary(
-		pcd.data(), cloud2,
-		version,
-		/*compressed=*/false,
-		data_idx
-	);
-
-	pcl::PointCloud<PointT> out;
-	pcl::fromPCLPointCloud2(cloud2, out);
-	out.sensor_origin_ = origin;
-	out.sensor_orientation_ = orientation;
-	return out;
 }
 
 std::wstring s2ws(const std::string& s) //string -> LPCWSTR needs first conversion to wstring then to LPCWSTR.
@@ -6794,7 +6535,7 @@ bool CLPS_Detection_PCA(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool isL
 
 					pcUnderHole = pcTargetBase->points.size();
 
-					if (pcTargetBase->points.size() > 2000)
+					if (pcTargetBase->points.size() > 1000)
 					{
 						if (clps_current_count_pca < CLPS_NCOUNT) clps_current_count_pca++;
 						else
@@ -7151,7 +6892,6 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 	ProcessResults procResults;
 	try
 	{
-		
 		JOB_INFO.print_jobInfo();
 		logMessage("Operation Sensor Position: " + OP_SENSOR_POS);
 
@@ -7373,11 +7113,11 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 			if (jobLog) jobLogMessage("LandOut PCA: " + std::to_string(landout_detected_pca));
 		}
 		
-		if (!clps_ok_detected || debugMode)
+		if (debugMode) //if (!clps_ok_detected || debugMode)
 			CLPS_Detection_PCA(_basePointCloud, _isLeftSensor, _target_hole, _hole_pos, _g_data_limit, _t_data_limit, _detected_hole, _sprdLanded, ref(_refPCUnderHole), ref(_clps_y_level), savePath, jobLog);
 
 		bool _blnSeparated = false;
-		if ((!clps_ok_detected && !clps_ok_detected_pca) || debugMode)
+		if (debugMode) //((!clps_ok_detected && !clps_ok_detected_pca) || debugMode)
 			_blnSeparated = CLPS_Detection_PCA_Only(_basePointCloud, _isLeftSensor, ref(_pca_dev_y), savePath);
 
 		auto t_stop_pca = std::chrono::high_resolution_clock::now();
@@ -7386,8 +7126,8 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 		if (jobLog) jobLogMessage("PCA Proc Time in ms: " + std::to_string(t_dur_pca) + "ms");
 
 
-		bCLPS_Detected_Out = (clps_detected || (!clps_ok_detected && clps_detected_pca));
-		bCLPS_OK_Detected_Out = (clps_ok_detected || clps_ok_detected_pca || clps_ok_detected_pca_only);
+		bCLPS_Detected_Out = (clps_detected); //|| (!clps_ok_detected && clps_detected_pca));
+		bCLPS_OK_Detected_Out = (clps_ok_detected);// || clps_ok_detected_pca || clps_ok_detected_pca_only);
 
 		bLandout_Detected_Out = (landout_detected);// || landout_detected_pca);
 		bLandOK_Detected_Out = (landok_detected);// || landok_detected_pca);
