@@ -1,3 +1,14 @@
+Seoho Visionary T-Mini for LSTP.
+
+Unzip sick_visioanry_cpp_shared/
+
+then do the following:
+"mkdir build"
+"cd build"
+"cmake .."
+
+this will generate visual studio project.
+
 = sick_visionary_cpp_samples
 
 
