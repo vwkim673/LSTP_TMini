@@ -135,6 +135,7 @@
 
 #pragma comment(lib, "Dbghelp.lib")
 #include <DbgHelp.h>
+#pragma comment(lib, "Shlwapi.lib")
 
 #define DEFAULT_RECVLEN 50
 #define DEFAULT_SENDLEN 50
@@ -149,7 +150,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.4";
+const std::string program_version = "1.7";
 
 std::vector<std::string> class_names = { "HOLE", "CONE", "LANDED", "GUIDE" };
 
@@ -393,12 +394,14 @@ bool DEBUG_CONVERT_PCL_RANGE = false;
 
 bool SEQUENTIAL_PROCESSING = false;
 bool ENALBE_RESTART_APPLICATION = false;
+bool VA_ENABLE_ENHANCE = false;
 
 std::string CURRENT_SENSOR_POSITION = "REAR_LEFT";
 
 int PROB_LIMIT = 50;
 
 std::string onnx_model_path;
+std::string enhance_model_path;
 
 int LANE_NUM_AS_LEFT = 0;
 int LANE_NUM_AS_RIGHT = 0;
@@ -518,6 +521,7 @@ std::chrono::system_clock::time_point sensor_last_attempted_time = std::chrono::
 std::chrono::system_clock::time_point sensor_last_connected_time = std::chrono::system_clock::now();
 
 YOLO11Detector yolo_detector;
+YOLO11Detector yolo_enhance_detector;
 
 bool enable_stream = false;
 bool enable_process = false;
@@ -1171,11 +1175,36 @@ auto parseINI(string path) -> bool
 		PROB_LIMIT = std::stoi(inidata.get("SYSTEM").get("PROB_LIMIT"));
 		ENABLE_SAVE_LOG_BIT = inidata.get("SYSTEM").get("ENABLE_SAVE_LOG_BIT") == "1" ? true : false;
 
-		SEQUENTIAL_PROCESSING = inidata.get("SYSTEM").get("SEQUENTIAL_PROCESSING") == "1" ? true : false;
-		ENALBE_RESTART_APPLICATION = inidata.get("SYSTEM").get("ENABLE_RESTART_APPLICATION") == "1" ? true : false;
+		//SEQUENTIAL_PROCESSING = inidata.get("SYSTEM").get("SEQUENTIAL_PROCESSING") == "1" ? true : false;
+		//ENALBE_RESTART_APPLICATION = inidata.get("SYSTEM").get("ENABLE_RESTART_APPLICATION") == "1" ? true : false;
+
+		try
+		{
+			VA_ENABLE_ENHANCE = inidata.get("SYSTEM").get("VA_ENABLE_ENHANCE") == "1" ? true : false;
+		}
+		catch (std::exception& e)
+		{
+			logMessage("Error in parsing VA_ENABLE_ENHANCE, set to false : " + std::string(e.what()));
+			VA_ENABLE_ENHANCE = false;
+		}
 
 		onnx_model_path = inidata.get("MODEL").get("ONNX_PATH");
 		logMessage("onnx model path: " + onnx_model_path);
+
+		try
+		{
+			if (VA_ENABLE_ENHANCE)
+			{
+				enhance_model_path = inidata.get("MODEL").get("ENHANCE_MODEL_PATH");
+				logMessage("Enhance model path: " + enhance_model_path);
+			}
+		}
+		catch (std::exception& e)
+		{
+			logMessage("Error in parsing ENHANCE_MODEL_PATH, set to empty : " + std::string(e.what()));
+			enhance_model_path = "";
+			VA_ENABLE_ENHANCE = false;
+		}
 
 		MODE_DEBUG = inidata.get("DEBUG").get("MODE_DEBUG") == "1" ? true : false;
 		if (MODE_DEBUG) logMessage("Debug mode enabled!");
@@ -4125,6 +4154,112 @@ pcl::PointXYZ pc_landed_detection_naive(const pcl::PointCloud<pcl::PointXYZ>::Pt
 
 //PointCloud :: Guide Detection
 
+static inline cv::Mat enhanceForYolo(const cv::Mat& bgr)
+{
+	CV_Assert(!bgr.empty());
+	CV_Assert(bgr.type() == CV_8UC3);
+
+	// ---- fixed internal knobs (no external params) ----
+	constexpr float  P_LOW = 0.5f;    // black percentile
+	constexpr float  P_HIGH = 99.5f;   // white percentile
+	constexpr int    STEP = 2;       // histogram subsampling
+	constexpr int    SKIP_TOP_FRAC = 5; // ignore top 1/5 (overlay text area)
+	constexpr double TARGET_MED = 0.55; // target median (0..1) after stretch
+	constexpr double MAX_GAMMA = 3.0;   // don't over-brighten
+	constexpr float  EMA = 0.85f;       // smoothing to reduce flicker
+
+	// Convert to YCrCb, work on Y only (keeps chroma stable)
+	cv::Mat ycrcb;
+	cv::cvtColor(bgr, ycrcb, cv::COLOR_BGR2YCrCb);
+
+	std::vector<cv::Mat> ch;
+	cv::split(ycrcb, ch);
+	cv::Mat& Y = ch[0]; // CV_8U
+
+	// ROI: ignore top area (common for red overlays)
+	int y0 = Y.rows / SKIP_TOP_FRAC;
+	cv::Rect roi(0, y0, Y.cols, Y.rows - y0);
+	if (roi.height <= 0) roi = cv::Rect(0, 0, Y.cols, Y.rows);
+
+	// Histogram on ROI (subsampled)
+	int hist[256] = { 0 };
+	int total = 0;
+	for (int y = roi.y; y < roi.y + roi.height; y += STEP) {
+		const uchar* row = Y.ptr<uchar>(y);
+		for (int x = roi.x; x < roi.x + roi.width; x += STEP) {
+			hist[row[x]]++;
+			total++;
+		}
+	}
+	if (total <= 0) return bgr.clone();
+
+	auto findPercentile = [&](int target)->int {
+		int cdf = 0;
+		for (int i = 0; i < 256; ++i) { cdf += hist[i]; if (cdf >= target) return i; }
+		return 255;
+		};
+
+	int loNew = findPercentile((int)std::lround((P_LOW / 100.f) * total));
+	int hiNew = findPercentile((int)std::lround((P_HIGH / 100.f) * total));
+	int medNew = findPercentile(total / 2);
+	if (hiNew <= loNew) hiNew = std::min(loNew + 1, 255);
+
+	// Persistent state (per thread) for stability
+	static thread_local int lastLo = 0, lastHi = 255;
+	static thread_local double lastInvGamma = 1.0;
+	static thread_local cv::Mat lut; // 1x256 CV_8U
+
+	// Smooth lo/hi to avoid flicker
+	int lo = (int)std::lround(EMA * lastLo + (1.0f - EMA) * loNew);
+	int hi = (int)std::lround(EMA * lastHi + (1.0f - EMA) * hiNew);
+	hi = std::max(hi, lo + 1);
+
+	// Decide whether to do stretching (avoid overprocessing good frames)
+	const int range = hi - lo;
+	bool doStretch = (range < 200) || (hi < 230) || (lo > 10);
+	if (!doStretch) { lo = 0; hi = 255; } // effectively disables stretch
+
+	// Auto gamma only if dark (don’t darken bright frames)
+	// Compute median in stretched space
+	double v = (double(medNew) - double(lo)) / double(std::max(1, hi - lo));
+	v = std::min(0.999, std::max(0.001, v));
+
+	// If already bright enough, keep gamma=1 (no change)
+	double invGamma = 1.0;
+	if (v < TARGET_MED) {
+		// want pow(v, invGamma) == TARGET_MED
+		invGamma = std::log(TARGET_MED) / std::log(v);
+		double gamma = 1.0 / invGamma;
+		gamma = std::min(MAX_GAMMA, std::max(1.0, gamma)); // only brighten
+		invGamma = 1.0 / gamma;
+	}
+
+	// Smooth gamma too
+	invGamma = EMA * lastInvGamma + (1.0 - EMA) * invGamma;
+
+	// Build LUT (clamp -> stretch -> gamma)
+	lut.create(1, 256, CV_8U);
+	uchar* L = lut.ptr<uchar>(0);
+	const double denom = double(std::max(1, hi - lo));
+
+	for (int i = 0; i < 256; ++i) {
+		double t = (double(i) - double(lo)) / denom;
+		t = std::min(1.0, std::max(0.0, t));
+		double y = std::pow(t, invGamma) * 255.0;
+		L[i] = (uchar)cv::saturate_cast<uchar>(y);
+	}
+
+	lastLo = lo; lastHi = hi; lastInvGamma = invGamma;
+
+	// Apply LUT to Y channel only
+	cv::LUT(Y, lut, Y);
+
+	cv::merge(ch, ycrcb);
+	cv::Mat out;
+	cv::cvtColor(ycrcb, out, cv::COLOR_YCrCb2BGR);
+	return out;
+}
+
 cv::Mat drawOnImage(cv::Mat input, std::vector<rectangle_info> det_results)
 {
 	cv::Mat result_image = input.clone();
@@ -4595,7 +4730,7 @@ auto tmini_data_stream() -> void
 							pDataHandler->generatePointCloud(pointCloud);
 							pDataHandler->transformPointCloud(pointCloud);
 
-							auto distMap = pDataHandler->getDistanceMap();
+							//auto distMap = pDataHandler->getDistanceMap();
 							//logMessage("DistMap: " + std::to_string(distMap.size()));
 
 							auto intensityMap = pDataHandler->getIntensityMap();
@@ -4648,7 +4783,7 @@ auto tmini_data_stream() -> void
 							if (true)
 							{
 								logMessage("Data stack updating stack with new data...");
-								auto res = dataStack.Update_Stack(grayToClr, *pclPointCloud, distMap, last_frame_get_time);
+								auto res = dataStack.Update_Stack(grayToClr, *pclPointCloud, std::vector<uint16_t>(), last_frame_get_time);
 								if (res) logMessage("Data Stack Updated Successfully!");
 								else logMessage("Data Stack Update Failed!");
 
@@ -4899,6 +5034,8 @@ bool yolo_inference(YOLO11Detector& detector, std::string SENSOR_POSITION, cv::M
 
 			det_count++;
 			det_sorted_objects.at(box.label).push_back(box);
+
+			logMessage("Det Object: " + std::to_string(box.label) + "," + std::to_string(box.x) + "," + std::to_string(box.y) + "," + std::to_string(box.w) + "," + std::to_string(box.h) + "," + std::to_string(box.prob));
 
 			if (jobLog) jobLogMessage("Det Object: " + std::to_string(box.label) + "," + std::to_string(box.x) + "," + std::to_string(box.y) + "," + std::to_string(box.w) + "," + std::to_string(box.h) + "," + std::to_string(box.prob));
 		}
@@ -6535,7 +6672,7 @@ bool CLPS_Detection_PCA(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool isL
 
 					pcUnderHole = pcTargetBase->points.size();
 
-					if (pcTargetBase->points.size() > 1000)
+					if (pcTargetBase->points.size() > 1300)
 					{
 						if (clps_current_count_pca < CLPS_NCOUNT) clps_current_count_pca++;
 						else
@@ -6895,6 +7032,8 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 		JOB_INFO.print_jobInfo();
 		logMessage("Operation Sensor Position: " + OP_SENSOR_POS);
 
+		bool enhanceUsed = false;
+
 		int _g_data_limit = G_DATA_LIMIT;
 		int _t_data_limit = 2000;
 		bool _isLeftSensor = false;
@@ -6906,6 +7045,7 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 		else { _t_data_limit = T_DATA_LIMIT; }
 
 		cv::Mat res_image = image.clone();
+		cv::Mat res_image2 = image.clone();
 
 		int _det_count = 0;
 		std::vector<rectangle_info> _det_results;
@@ -6917,6 +7057,36 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 		auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_Endtime - inference_time);
 		logMessage("VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
 		if (jobLog) jobLogMessage("VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
+
+		//Stage-2: enhanced image inference if needed.
+		bool coneDetected = (_det_sorted_objects[1].size() > 0 || _det_sorted_objects[2].size() > 0); //cone or landed detected from stage-1.
+		if (!coneDetected && VA_ENABLE_ENHANCE)
+		{
+			logMessage("Staging for enhanced image inference as cone/landed is not detected from stage-1.");
+
+			//Try enhanced
+			cv::Mat enhanced_image = enhanceForYolo(image);
+			int _det_count2 = 0;
+			std::vector<rectangle_info> _det_results2;
+			std::vector<std::vector<bbx>> _det_sorted_objects2(class_names.size(), std::vector<bbx>(0));
+
+			auto inference_status2 = yolo_inference(yolo_enhance_detector, OP_SENSOR_POS, enhanced_image, ref(res_image2), ref(_det_results2), ref(_det_sorted_objects2), ref(_det_count2), savePath);
+
+			if (_det_count2 > 0)
+			{
+				//add the results to original results if there are any.
+				for (int i = 0; i < class_names.size(); i++)
+				{
+					for (auto& bb : _det_sorted_objects2[i])
+					{
+						_det_sorted_objects[i].push_back(bb);
+						_det_count++;
+					}
+				}
+
+				enhanceUsed = true;
+			}
+		}
 
 		//Initialize variables
 		std::string _detected_chassisType = "Unknown";
@@ -7113,7 +7283,7 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 			if (jobLog) jobLogMessage("LandOut PCA: " + std::to_string(landout_detected_pca));
 		}
 		
-		if (debugMode) //if (!clps_ok_detected || debugMode)
+		if (!clps_ok_detected || debugMode)
 			CLPS_Detection_PCA(_basePointCloud, _isLeftSensor, _target_hole, _hole_pos, _g_data_limit, _t_data_limit, _detected_hole, _sprdLanded, ref(_refPCUnderHole), ref(_clps_y_level), savePath, jobLog);
 
 		bool _blnSeparated = false;
@@ -7150,6 +7320,9 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 
 		logLines += std::to_string(bCLPS_Detected_Out) + ";" + std::to_string(bCLPS_OK_Detected_Out) + ";";
 		logLines += std::to_string(bLandout_Detected_Out) + ";" + std::to_string(bLandOK_Detected_Out);
+
+		//Latest Update
+		logLines += ";" + std::to_string(enhanceUsed);
 
 		if (JOB_INFO.isOffloadCycle)
 		{
@@ -7687,6 +7860,236 @@ void OfflineDebugBatchProcessingThread()
 	}
 }
 
+void Enhance_image_dataset()
+{
+	logMessage("Debug Batch Job on " + DEBUG_BATCH_ROOT_DIR + " to be processed and saved to " + DEBUG_BATCH_SAVE_DIR);
+
+	//Get list of sub directories given ROOT DIR.
+	auto jobDirectories = ListSubDirectories(DEBUG_BATCH_ROOT_DIR);
+
+	for (const auto& jobDir : jobDirectories)
+	{
+		logMessage("Processing: " + jobDir);
+
+		//load .jpg, .ply files for processing
+		auto image_filePath = jobDir;// +"/" + std::string("Image");
+		//auto dist_filePath = jobDir + "/" + std::string("DistMap");
+
+		std::filesystem::path pathObj = std::filesystem::path(jobDir).lexically_normal();
+		std::string lastDirectory = pathObj.filename().string();
+
+		auto image_files = getAllFiles(image_filePath, ".jpg");
+
+		createDirectory_ifexists(DEBUG_BATCH_SAVE_DIR);
+		auto save_file_path = DEBUG_BATCH_SAVE_DIR + "/" + lastDirectory;
+		auto folder_created = createDirectory_ifexists(save_file_path);
+
+		if (!folder_created)
+		{
+			logMessage("Skipping already existing folder: " + save_file_path);
+			continue;
+		}
+
+		logMessage("Saving to " + save_file_path);
+		for (int i = 0; i < image_files.size(); i++)
+
+		{
+			logMessage("Processing Cycle Start!");
+
+			std::filesystem::path pathObj(image_files.at(i));
+			// Get the filename with extension
+			std::string filename = pathObj.stem().string();
+
+			std::string log_lines = filename + ";";
+
+			//folder for each file
+			auto save_current_file_path = save_file_path + "/" + filename;
+			createDirectory_ifexists(save_current_file_path);
+
+			std::string save_path = save_current_file_path + "/" + filename;
+
+			//load image
+			cv::Mat image = cv::imread(image_files.at(i));
+			cv::Mat res_image;
+			if (image.empty())
+			{
+				logMessage("Couldn't read file by JPG " + image_files.at(i));
+				continue;
+			}
+
+			//Try enhanced
+			auto t_start_enhance = std::chrono::high_resolution_clock::now();
+			cv::Mat enhanced_image = enhanceForYolo(image);
+			auto t_stop_enhance = std::chrono::high_resolution_clock::now();
+			auto t_dur_enhance = std::chrono::duration_cast<std::chrono::milliseconds>(t_stop_enhance - t_start_enhance).count();
+			logMessage("Image enhance time in ms: " + std::to_string(t_dur_enhance) + "ms");
+
+			if (!enhanced_image.empty()) cv::imwrite(save_current_file_path + "/" + filename + ".jpg", enhanced_image);
+		}
+	}
+}
+
+//Inference difference Test
+void VA_model_Test()
+{
+	std::string modelPath1 = app_path + "/model/20250723_LSTP_TMINI.onnx";
+	std::string modelPath2 = app_path + "/model/20260227_LSTP_TMini_v11.onnx";
+	std::string labelsPath = app_path + "/INI/classes.txt";
+	YOLO11Detector original_detector(modelPath1, labelsPath, true);
+	YOLO11Detector updated_detector(modelPath2, labelsPath, true);
+
+	//Get list of sub directories given ROOT DIR.
+	auto jobDirectories = ListSubDirectories(DEBUG_BATCH_ROOT_DIR);
+
+	auto logHeader_offload_batch = std::string("Image;Both_Hole;Both_Cone;Either_Hole;Either_Cone;None_Hole;None_Cone;Hole1Only;Hole2Only;Cone1Only;Cone2Only;Hole1;Hole2;Cone1;Cone2");
+
+	ofstream Simfile_batch;
+	std::string sim_batch_result_txt = DEBUG_BATCH_ROOT_DIR + "/image_test_batch_results.txt";
+	Simfile_batch.open(sim_batch_result_txt.c_str(), ios::out | ios::app);
+	if (!Simfile_batch.is_open())
+	{
+		logMessage("Failed to open file?");
+	}
+	if (Simfile_batch.is_open())
+	{
+		Simfile_batch << logHeader_offload_batch + "\n";
+		Simfile_batch.close();
+	}
+
+	for (const auto& jobDir : jobDirectories)
+	{
+		logMessage("Processing: " + jobDir);
+
+		//load .jpg, .ply files for processing
+		auto image_filePath = jobDir;// +"/" + std::string("Image");
+		//auto dist_filePath = jobDir + "/" + std::string("DistMap");
+
+		std::filesystem::path pathObj = std::filesystem::path(jobDir).lexically_normal();
+		std::string lastDirectory = pathObj.filename().string();
+
+		auto image_files = getAllFiles(image_filePath, ".jpg");
+
+		createDirectory_ifexists(DEBUG_BATCH_SAVE_DIR);
+		auto save_file_path = DEBUG_BATCH_SAVE_DIR + "/" + lastDirectory;
+		auto folder_created = createDirectory_ifexists(save_file_path);
+
+		if (!folder_created)
+		{
+			logMessage("Skipping already existing folder: " + save_file_path);
+			continue;
+		}
+
+		logMessage("Saving to " + save_file_path);
+		for (int i = 0; i < image_files.size(); i++)
+		{
+			logMessage("Processing Cycle Start!");
+
+			std::filesystem::path pathObj(image_files.at(i));
+			// Get the filename with extension
+			std::string filename = pathObj.stem().string();
+
+			std::string log_lines = filename + ";";
+
+			//folder for each file
+			auto save_current_file_path = save_file_path + "/" + filename;
+			createDirectory_ifexists(save_current_file_path);
+
+			std::string save_path = save_current_file_path + "/" + filename;
+
+			//load image
+			cv::Mat image = cv::imread(image_files.at(i));
+			cv::Mat res_image1, res_image2;
+			if (image.empty())
+			{
+				logMessage("Couldn't read file by JPG " + image_files.at(i));
+				continue;
+			}
+
+			//Try enhanced
+			auto t_start_enhance = std::chrono::high_resolution_clock::now();
+			cv::Mat enhanced_image = enhanceForYolo(image);
+			auto t_stop_enhance = std::chrono::high_resolution_clock::now();
+			auto t_dur_enhance = std::chrono::duration_cast<std::chrono::milliseconds>(t_stop_enhance - t_start_enhance).count();
+			logMessage("Image enhance time in ms: " + std::to_string(t_dur_enhance) + "ms");
+
+			if (!enhanced_image.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced.jpg", enhanced_image);
+
+			res_image1 = image.clone();
+			res_image2 = enhanced_image.clone();
+
+			bool isLeftSensor = false;
+			if (DEBUG_SENSOR_POSITION.find("LEFT") != std::string::npos)
+			{
+				isLeftSensor = true;
+			}
+
+			std::string savePath1 = save_current_file_path + "/" + filename;
+			std::string savePath2 = save_current_file_path + "/" + filename + "_enhanced";
+
+			int _det_count1 = 0;
+			std::vector<rectangle_info> _det_results1;
+			std::vector<std::vector<bbx>> _det_sorted_objects1(class_names.size(), std::vector<bbx>(0));
+
+			auto inference_time = std::chrono::high_resolution_clock::now();
+			auto inference_status = yolo_inference(original_detector, DEBUG_SENSOR_POSITION, image, ref(res_image1), ref(_det_results1), ref(_det_sorted_objects1), ref(_det_count1), savePath1);
+			auto inference_Endtime = std::chrono::high_resolution_clock::now();
+			auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_Endtime - inference_time);
+			logMessage("Original VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
+			
+			int _det_count2 = 0;
+			std::vector<rectangle_info> _det_results2;
+			std::vector<std::vector<bbx>> _det_sorted_objects2(class_names.size(), std::vector<bbx>(0));
+
+			auto inference_time2 = std::chrono::high_resolution_clock::now();
+			auto inference_status2 = yolo_inference(updated_detector, DEBUG_SENSOR_POSITION, enhanced_image, ref(res_image2), ref(_det_results2), ref(_det_sorted_objects2), ref(_det_count2), savePath2);
+			auto inference_Endtime2 = std::chrono::high_resolution_clock::now();
+			auto inference_duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(inference_Endtime2 - inference_time2);
+			logMessage("Updated VA Inference Time= " + std::to_string(inference_duration2.count()) + "ms");
+
+			if (!res_image1.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_original_res.jpg", res_image1);
+			if (!res_image2.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced_res.jpg", res_image2);
+
+			bool holeDetected1 = (_det_sorted_objects1[0].size() > 0);
+			bool holeDetected2 = (_det_sorted_objects2[0].size() > 0);
+
+			bool coneDetected1 = (_det_sorted_objects1[1].size() > 0 || _det_sorted_objects1[2].size() > 0);
+			bool coneDetected2 = (_det_sorted_objects2[1].size() > 0 || _det_sorted_objects2[2].size() > 0);
+
+			bool hole_both_detected = holeDetected1 && holeDetected2;
+			bool cone_both_detected = coneDetected1 && coneDetected2;
+
+			bool hole_either_detected = holeDetected1 || holeDetected2;
+			bool cone_either_detected = coneDetected1 || coneDetected2;
+
+			bool hole1_not2 = holeDetected1 && !holeDetected2;
+			bool hole2_not1 = holeDetected2 && !holeDetected1;
+
+			bool cone1_not2 = coneDetected1 && !coneDetected2;
+			bool cone2_not1 = coneDetected2 && !coneDetected1;
+
+			log_lines += std::string(hole_both_detected ? "1" : "0") + ";" + std::string(cone_both_detected ? "1" : "0") + ";" + std::string(hole_either_detected ? "1" : "0") + ";" + std::string(cone_either_detected ? "1" : "0") + ";";
+
+			log_lines += std::string((!holeDetected1 && !holeDetected2) ? "1" : "0") + ";" + std::string((!coneDetected1 && !coneDetected2) ? "1" : "0") + ";";
+
+			log_lines += std::string(hole1_not2 ? "1" : "0") + ";" + std::string(hole2_not1 ? "1" : "0") + ";" + std::string(cone1_not2 ? "1" : "0") + ";" + std::string(cone2_not1 ? "1" : "0") + ";";
+			
+			log_lines += std::string(holeDetected1 ? "1" : "0") + ";" + std::string(holeDetected2 ? "1" : "0") + ";" + std::string(coneDetected1 ? "1" : "0") + ";" + std::string(coneDetected2 ? "1" : "0");
+
+			Simfile_batch.open(sim_batch_result_txt.c_str(), ios::out | ios::app);
+			if (!Simfile_batch.is_open())
+			{
+				logMessage("Failed to open file?");
+			}
+			if (Simfile_batch.is_open())
+			{
+				Simfile_batch << log_lines + "\n";
+				Simfile_batch.close();
+			}
+		}
+	}
+	
+}
+
 pcl::PointXYZ pc_hole_detection_zedx(const pcl::PointCloud<pcl::PointXYZ>::Ptr& pcInput, bool isLeftSide, std::string save_path)
 {
 	pcl::PointXYZ hole_position(10000, -10000, 10000);
@@ -8077,7 +8480,7 @@ int start_server() {
 		WSACleanup();
 		return 1;
 	}
-
+	//std::cout << "Running now" << std::endl;
 	logMessage("Server listening on port " + std::to_string(SOCKET_PORT) + "...");
 
 	while (socket_running.load()) 
@@ -8466,6 +8869,130 @@ std::string getParent(const std::string& pathStr) {
 	fs::path p(pathStr);
 	return p.parent_path().string();
 }
+
+
+//STD CERR REDIRECT.
+static std::wstring GetExeDirW()
+{
+	wchar_t buf[MAX_PATH]{};
+	DWORD n = GetModuleFileNameW(nullptr, buf, MAX_PATH);
+	if (n == 0 || n >= MAX_PATH) return L".";
+	std::filesystem::path p(buf);
+	return p.parent_path().wstring();
+}
+
+static std::wstring NowYMD()
+{
+	auto now = std::chrono::system_clock::now();
+	std::time_t t = std::chrono::system_clock::to_time_t(now);
+	tm lt{};
+	localtime_s(&lt, &t);
+	wchar_t s[16];
+	swprintf_s(s, L"%04d%02d%02d", lt.tm_year + 1900, lt.tm_mon + 1, lt.tm_mday);
+	return s;
+}
+
+static void DebugOut(const std::wstring& s)
+{
+	OutputDebugStringW((s + L"\n").c_str());
+}
+
+static bool InitStderrLogToExeFolder(std::wstring* outPath = nullptr)
+{
+	std::wstring exeDir = GetExeDirW();
+	std::wstring logDir = exeDir + L"\\log";
+
+	// 1) 폴더 생성 실패 여부 확인
+	std::error_code ec;
+	std::filesystem::create_directories(logDir, ec);
+	if (ec) {
+		DebugOut(L"[LOG] create_directories failed: " + logDir + L" ec=" + std::to_wstring(ec.value()));
+		return false;
+	}
+
+	std::wstring path = logDir + L"\\err_" + NowYMD() + L".txt";
+	if (outPath) *outPath = path;
+
+	// 2) 파일 열기 (공유 읽기 허용!)
+	HANDLE h = CreateFileW(
+		path.c_str(),
+		FILE_APPEND_DATA,
+		FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, // ✅ 다른 프로세스에서 열 수 있게
+		nullptr,
+		OPEN_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		nullptr);
+
+	if (h == INVALID_HANDLE_VALUE) {
+		DWORD e = GetLastError();
+		DebugOut(L"[LOG] CreateFileW failed: " + path + L" gle=" + std::to_wstring(e));
+		return false;
+	}
+
+	// 3) "진짜로 쓰기 되는지" 먼저 강제로 한 줄 써보기 (이게 안 보이면 flush 문제가 아님)
+	{
+		const char* msg = "[LOG] init ok (WriteFile test)\r\n";
+		DWORD written = 0;
+		BOOL ok = WriteFile(h, msg, (DWORD)strlen(msg), &written, nullptr);
+		FlushFileBuffers(h);
+		if (!ok) {
+			DWORD e = GetLastError();
+			DebugOut(L"[LOG] WriteFile failed gle=" + std::to_wstring(e));
+			CloseHandle(h);
+			return false;
+		}
+	}
+
+	// 4) 이제 stderr를 이 파일로 연결
+	int fd = _open_osfhandle((intptr_t)h, _O_APPEND | _O_TEXT);
+	if (fd == -1) {
+		DebugOut(L"[LOG] _open_osfhandle failed");
+		CloseHandle(h);
+		return false;
+	}
+
+	if (_dup2(fd, _fileno(stderr)) != 0) {
+		DebugOut(L"[LOG] _dup2(stderr) failed");
+		_close(fd);
+		return false;
+	}
+	_close(fd); // stderr 쪽으로 복제됐으니 원본 fd는 닫아도 됨
+
+	// 5) iostream이 즉시 쓰도록(디버그용)
+	setvbuf(stderr, nullptr, _IONBF, 0);     // stderr 버퍼링 끔 (확인 끝나면 성능 위해 제거 가능)
+
+	DebugOut(L"[LOG] stderr redirected to: " + path);
+	return true;
+}
+
+//PREVENT MULTIPLE INSTANCE FROM SAME FOLDER
+
+// 간단하고 충분한: FNV-1a 64-bit 해시
+static uint64_t Fnv1a64(const std::wstring& s)
+{
+	const uint64_t FNV_OFFSET = 1469598103934665603ull;
+	const uint64_t FNV_PRIME = 1099511628211ull;
+
+	uint64_t h = FNV_OFFSET;
+	for (wchar_t c : s) {
+		// wchar_t를 2바이트 단위로 반영(Windows)
+		uint16_t v = static_cast<uint16_t>(c);
+		h ^= (v & 0xFF);  h *= FNV_PRIME;
+		h ^= (v >> 8);    h *= FNV_PRIME;
+	}
+	return h;
+}
+
+static std::string ToLowerNarrow(std::wstring s)
+{
+	std::transform(s.begin(), s.end(), s.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+	// 폴더 경로는 ASCII 범위가 대부분이므로 간단 변환(필요하면 UTF-8 변환 함수 사용)
+	std::string out;
+	out.reserve(s.size());
+	for (wchar_t c : s) out.push_back((c <= 0x7F) ? (char)c : '_');
+	return out;
+}
+
 int main(int argc, char* argv[])
 {
 	wchar_t buf[MAX_PATH];
@@ -8533,12 +9060,23 @@ int main(int argc, char* argv[])
 
 	model_initialized = (detections.size() > 0) ? true : false;
 
+	if (VA_ENABLE_ENHANCE)
+	{
+		std::string modelPath2 = app_path + "/" + enhance_model_path;
+
+		yolo_enhance_detector.initialize(modelPath, labelsPath, useGPU);
+		std::vector<Detection> detections = yolo_enhance_detector.detect(frame, confThreshold, iouThreshold);
+
+		logMessage("Enhance model initialized with " + std::to_string(detections.size()) + " detections on sample image.");
+	}
+
 	if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
 	{
 		//test();
 
-		if (DEBUG_BATCH_JOB) OfflineDebugBatchProcessingThread();
-
+		OfflineDebugBatchProcessingThread();
+		//VA_model_Test();
+		//Enhance_image_dataset();
 		//std::thread rtspT(rtsp_stream_receiver);
 		//rtspT.join();
 		//if (DEBUG_BATCH_JOB) ZedX_Processing_Test();
@@ -8598,6 +9136,7 @@ int main(int argc, char* argv[])
 	}
 	else
 	{
+		std::cout << "Running now!" << std::endl;
 		std::thread sckT(start_server);
 		//std::thread sckClientThread(socketClient, SOCKET_IP, SOCKET_PORT);
 
@@ -8654,3 +9193,202 @@ int main(int argc, char* argv[])
 
 	return 1;
 }
+
+/*
+int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int)
+{
+	std::wstring logPath;
+	bool ok = InitStderrLogToExeFolder(&logPath);
+
+	if (ok) {
+		std::fprintf(stderr, "App started (stderr)\r\n");
+		std::fflush(stderr);
+	}
+	else {
+		// 여기로 오면: 경로/권한/실행 위치 문제일 확률 큼
+		OutputDebugStringW(L"[LOG] InitStderrLogToExeFolder FAILED\n");
+	}
+
+	std::wstring dir = GetExeDirW();
+
+	// trailing slash 통일
+	if (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/')) dir.pop_back();
+
+	// 대소문자 무시 위해 소문자화(Windows 경로는 보통 case-insensitive)
+	std::wstring dirLower = dir;
+	std::transform(dirLower.begin(), dirLower.end(), dirLower.begin(), [](wchar_t c) { return (wchar_t)towlower(c); });
+
+	uint64_t h = Fnv1a64(dirLower);
+
+	char name[128];
+	// 같은 폴더에서만 막으면 보통 Local\로도 되지만, 세션/스케줄러까지 고려하면 Global\이 안전
+	sprintf_s(name, "Global\\MyApp_Folder_%016llX", (unsigned long long)h);
+
+	HANDLE mutex = CreateMutexA(nullptr, TRUE, name);
+	if (!mutex) {
+		std::cerr << "CreateMutex failed: " << GetLastError() << std::endl;
+		return 1;
+	}
+	if (GetLastError() == ERROR_ALREADY_EXISTS) {
+		std::cerr << "Another instance is already running (same folder)." << std::endl;
+		CloseHandle(mutex);
+		return 1;
+	}
+
+	SetUnhandledExceptionFilter(MyUnhandledExceptionFilter);
+
+	printf("Visionary T-Mini Logging App\n");
+
+	parseAppName(app_path);
+
+	appName = appID + "_v" + program_version;
+
+	//std::cout << "App: " << appName << "\n";
+
+	std::thread logThread(logWriterThread);
+
+	logMessage(appName + " Starting!");
+	logMessage(app_path);
+
+	signal(SIGINT, my_handler);
+	//std::set_terminate(unHandledExceptionHandler);
+
+	parseINI(app_path);
+	parseProcessINI(app_path);
+	parseIPINI(app_path);
+
+	//YOLOv11
+	bool useGPU = true;
+
+	std::string modelPath = app_path + "/" + onnx_model_path;
+	std::string labelsPath = app_path + "/INI/classes.txt";
+
+	//std::cout << "Initializing YOLOv11 detector with model: " << modelPath << std::endl;
+	//std::cout << "Classes file: " << labelsPath << std::endl;
+	//std::cout << "Using confidence threshold: " << confThreshold << ", IoU threshold: " << iouThreshold << std::endl;
+
+	// read model 
+	//std::cout << "Loading model and labels..." << std::endl;
+
+	//YOLO11Detector detector (modelPath, labelsPath, useGPU);
+
+	yolo_detector.initialize(modelPath, labelsPath, useGPU);
+	model_loaded = true;
+
+	std::string imagePath = app_path + "/sample.jpg";
+	cv::Mat frame = cv::imread(imagePath);
+	cv::Mat res_frame = frame.clone();
+
+	// Perform detection with the updated thresholds
+	std::vector<Detection> detections = yolo_detector.detect(frame, confThreshold, iouThreshold);
+
+	model_initialized = (detections.size() > 0) ? true : false;
+
+	if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
+	{
+		//test();
+
+		if (DEBUG_BATCH_JOB) OfflineDebugBatchProcessingThread();
+
+		//std::thread rtspT(rtsp_stream_receiver);
+		//rtspT.join();
+		//if (DEBUG_BATCH_JOB) ZedX_Processing_Test();
+	}
+	else if (MODE_DEBUG)
+	{
+		logMessage("Debug Mode running.. Testing for onnx.");
+
+		//CURRENT_SENSOR_POSITION = "REAR_LEFT";
+
+		DEBUG_IMG_PATH = DEBUG_SAMPLE_JOB + "/Image";
+		DEBUG_PLY_PATH = DEBUG_SAMPLE_JOB + "/Depth";
+
+		DEBUG_IMG_FILES = getAllFiles(DEBUG_IMG_PATH, ".jpg");
+		DEBUG_PLY_FILES = getAllFiles(DEBUG_PLY_PATH, ".pcd");
+
+		DEBUG_MAX_INDEX = (DEBUG_IMG_FILES.size() < DEBUG_PLY_FILES.size()) ? DEBUG_IMG_FILES.size() : DEBUG_PLY_FILES.size();
+		DEBUG_CURRENT_INDEX = 0;
+
+		
+		//std::thread sckT(start_server);
+		std::thread joblogThread(jobLogWriterThread);
+
+		std::thread sckTMini_Setup(thread_tmini_control);
+		std::thread sckTMini_Data_Stream(thread_tmini_data_stream);
+
+		//need to specify and enable connection.
+		//current_lane_ip = IP_ADDRESSES[0];
+
+		//trigger tmini setup and stream.
+		//tmini_ctrl_flag = true;
+		//cond_tmini_ctrl.notify_one();
+
+		//std::thread tProc(processingThread, std::ref(detector));
+		std::thread tSave(data_save_thread);
+
+		//tProc.join();
+		joblogThread.join();
+		sckTMini_Setup.join();
+		sckTMini_Data_Stream.join();
+		tSave.join();
+		//sckT.join();
+	}
+	else
+	{
+		std::thread sckT(start_server);
+		//std::thread sckClientThread(socketClient, SOCKET_IP, SOCKET_PORT);
+
+		//Visionary T Mini Streaming setup.
+		std::thread sckTMini_Setup(thread_tmini_control);
+		std::thread sckTMini_Data_Stream(thread_tmini_data_stream);
+
+		std::thread joblogThread(jobLogWriterThread);
+
+		std::thread tProc(processingThread);
+
+		std::thread tSave(data_save_thread);
+
+		if (tProc.joinable()) tProc.join();
+
+		job_log_running.store(false);
+		cvJobLog.notify_one();
+		if (joblogThread.joinable()) joblogThread.join();
+
+		if (sckT.joinable()) sckT.join();
+
+		if (trigger_terminate)
+		{
+			std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+			if (sckTMini_Setup.joinable())
+			{
+				logMessage("Program Just Shutting Down...");
+
+				log_running.store(false);
+				cvLog.notify_one();
+				logThread.join();
+
+				//std::cout << "Press any key to continue...";
+				//system("pause"); // Windows only
+				//std::exit(-1);
+				return 0;
+			}
+		}
+
+		if (sckTMini_Setup.joinable()) sckTMini_Setup.join();
+		if (sckTMini_Data_Stream.joinable()) sckTMini_Data_Stream.join();
+		if (tSave.joinable()) tSave.join();
+		//sckClientThread.join();
+	}
+
+	logMessage("Program Shutting Down...");
+
+	log_running.store(false);
+	cvLog.notify_one();
+	logThread.join();
+
+	//std::cout << "Press any key to continue...";
+	//system("pause"); // Windows only
+
+	return 1;
+}
+*/

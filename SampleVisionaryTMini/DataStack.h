@@ -82,7 +82,7 @@ class DataStack
                             std::vector<uint16_t> stack_distMap = distMap;
                             
                             //Create tuple with data.
-                            d_tuple1 = std::make_tuple(image, pointcloud, stack_distMap, ts);
+                            d_tuple1 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
 
                             isUsed1 = false;
                             isUpdated1 = true;
@@ -131,7 +131,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
                             std::vector<uint16_t> stack_distMap = distMap;
                             //Create tuple with data.
-                            d_tuple2 = std::make_tuple(image, pointcloud, stack_distMap, ts);
+                            d_tuple2 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
 
                             isUsed2 = false;
                             isUpdated2 = true;
@@ -183,7 +183,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
                             std::vector<uint16_t> stack_distMap = distMap;
                             //Create tuple with data.
-                            d_tuple2 = std::make_tuple(image, pointcloud, stack_distMap, ts);
+                            d_tuple2 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
 
                             isUsed2 = false;
                             isUpdated2 = true;
@@ -232,7 +232,7 @@ class DataStack
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
                             std::vector<uint16_t> stack_distMap = distMap;
                             //Create tuple with data.
-                            d_tuple1 = std::make_tuple(image, pointcloud, stack_distMap, ts);
+                            d_tuple1 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
 
                             isUsed1 = false;
                             isUpdated1 = true;
@@ -294,7 +294,7 @@ class DataStack
                                 //Copy data to reference objects.
 								cv::Mat stack_image = std::get<0>(d_tuple2);
 								pcl::PointCloud<pcl::PointXYZ> stack_pointcloud = std::get<1>(d_tuple2);
-                                std::vector<uint16_t> stack_distMap = std::get<2>(d_tuple2);
+                                std::vector<uint16_t> stack_distMap{};// = std::get<2>(d_tuple2);
 								std::chrono::system_clock::time_point stack_ts = std::get<3>(d_tuple2);
 								
                                 //Assign to output parameters.
@@ -528,13 +528,13 @@ class DataStack
         }
 
     private:
-        bool isReading1 = false, isReading2 = false;
-        bool isWriting1 = false, isWriting2 = false;
-        bool isUsed1 = false, isUsed2 = false;
-        bool isUpdated1 = false, isUpdated2 = false;
-        bool isEmpty1 = false, isEmpty2 = false;
-        int newStack_i = 1;
-        bool isAvailable1 = false, isAvailable2 = false;
+        std::atomic<bool> isReading1 = false, isReading2 = false;
+        std::atomic<bool> isWriting1 = false, isWriting2 = false;
+        std::atomic<bool> isUsed1 = false, isUsed2 = false;
+        std::atomic<bool> isUpdated1 = false, isUpdated2 = false;
+        std::atomic<bool> isEmpty1 = false, isEmpty2 = false;
+        std::atomic<int> newStack_i = 1;
+        std::atomic<bool> isAvailable1 = false, isAvailable2 = false;
  
         std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point> d_tuple1 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point>();
         std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point> d_tuple2 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point>();
