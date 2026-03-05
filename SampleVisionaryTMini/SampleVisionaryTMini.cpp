@@ -396,6 +396,8 @@ bool SEQUENTIAL_PROCESSING = false;
 bool ENALBE_RESTART_APPLICATION = false;
 bool VA_ENABLE_ENHANCE = false;
 
+int GPU_INDEX = 0;
+
 std::string CURRENT_SENSOR_POSITION = "REAR_LEFT";
 
 int PROB_LIMIT = 50;
@@ -813,43 +815,89 @@ std::string appName = "TMini";
 auto pDataHandler = std::make_shared<VisionaryTMiniData>();
 VisionaryDataStream dataStream(pDataHandler);
 VisionaryControl visionaryControl;
-
-class ThreadSafeQueue
+//Save Update 2026.03.04
+struct SaveTask
 {
+	cv::Mat oImage;
+	cv::Mat resImage;
+	pcl::PointCloud<pcl::PointXYZ>::ConstPtr cloud; //pointer not value
+	bool isJobLog;
+	std::string msg;
+	std::chrono::system_clock::time_point frameTime;
+
+	SaveTask() = default;
+
+	// Constructor matching the usage: SaveTask(img, res_img, pcPointCloud, true, std::move(msg), ts);
+	SaveTask(const cv::Mat& oImg,
+		const cv::Mat& rImg,
+		const pcl::PointCloud<pcl::PointXYZ>::ConstPtr& cld,
+		bool jobLog,
+		std::string&& message,
+		std::chrono::system_clock::time_point time)
+		: oImage(oImg.clone()),
+		resImage(rImg.clone()),
+		cloud(cld),
+		isJobLog(jobLog),
+		msg(std::move(message)),
+		frameTime(time)
+	{
+	}
+};
+
+class ThreadSafeQueue {
 private:
-	std::queue <std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, bool, std::string, std::chrono::system_clock::time_point>> queue;
-	std::mutex mtx;
+	std::queue<SaveTask> q;
+	mutable std::mutex mtx;
 	std::condition_variable cv;
+	bool stopping = false;
 
 public:
-	void push(std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, bool, std::string, std::chrono::system_clock::time_point> value) {
-		std::lock_guard<std::mutex> lock(mtx);
-		queue.push(value);
-		cv.notify_one(); // Notify the consumer
+	void push(SaveTask&& task) {
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			q.push(std::move(task));
+		}
+		cv.notify_one();
 	}
 
-	// Pop element from the queue (blocks if empty)
-	std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, bool, std::string, std::chrono::system_clock::time_point> pop() {
+	// Blocks until an item exists OR stop() is called.
+	bool pop(SaveTask& out) {
 		std::unique_lock<std::mutex> lock(mtx);
-		cv.wait(lock, [this] { return !queue.empty(); }); // Wait until queue is non-empty
-		std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, bool, std::string, std::chrono::system_clock::time_point> value = queue.front();
-		queue.pop();
-		return value;
+		cv.wait(lock, [&] { return stopping || !q.empty(); });
+		if (stopping && q.empty()) return false;
+		out = std::move(q.front());
+		q.pop();
+		return true;
 	}
 
-	int GetQueueLen()
-	{
+	// Optional: batch drain
+	bool try_pop(SaveTask& out) {
 		std::lock_guard<std::mutex> lock(mtx);
-		return queue.size();
+		if (q.empty()) return false;
+		out = std::move(q.front());
+		q.pop();
+		return true;
+	}
+
+	void stop() {
+		{
+			std::lock_guard<std::mutex> lock(mtx);
+			stopping = true;
+		}
+		cv.notify_all();
+	}
+
+	size_t size() const {
+		std::lock_guard<std::mutex> lock(mtx);
+		return q.size();
 	}
 
 	void clear() {
 		std::lock_guard<std::mutex> lock(mtx);
-		while (!queue.empty()) {
-			queue.pop();
-		}
+		while (!q.empty()) q.pop();
 	}
 };
+
 
 ThreadSafeQueue tsq;
 DataStack dataStack;
@@ -1187,6 +1235,9 @@ auto parseINI(string path) -> bool
 			logMessage("Error in parsing VA_ENABLE_ENHANCE, set to false : " + std::string(e.what()));
 			VA_ENABLE_ENHANCE = false;
 		}
+
+		GPU_INDEX = std::stoi(inidata.get("SYSTEM").get("GPU_INDEX"));
+		logMessage("GPU Index: " + std::to_string(GPU_INDEX));
 
 		onnx_model_path = inidata.get("MODEL").get("ONNX_PATH");
 		logMessage("onnx model path: " + onnx_model_path);
@@ -2062,7 +2113,7 @@ void parseCommand(char recvbuf[])
 				logMessage("Deleting save logs as per command.");
 
 				//stop any files on queue
-				if (tsq.GetQueueLen() > 0)
+				if (tsq.size() > 0)
 				{
 					tsq.clear();
 					logMessage("Cleared Thread Safe Queue.");
@@ -2135,7 +2186,7 @@ void parseCommand(char recvbuf[])
 
 			if (ENALBE_RESTART_APPLICATION)
 			{
-				if (trigger_terminate && tsq.GetQueueLen() == 0)
+				if (trigger_terminate && tsq.size() == 0)
 				{
 					logMessage("Triggered Application Termination!");
 
@@ -4465,73 +4516,61 @@ bool save_to_drive_optimized(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pc
 void data_save_thread()
 {
 	logMessage("Data Logging Thread Activated");
-	try
+
+	SaveTask task;
+	while (logging_running.load())
 	{
-		while (logging_running.load())
+		// Blocks when empty; wakes on push(); exits cleanly on tsq.stop()
+		if (!tsq.pop(task)) break;
+
+		try
 		{
-			//Safe blocking op.
-			std::unique_lock<std::mutex> lock(mutex_logging);
-			bool res = cond_logging.wait_for(lock,
-				std::chrono::seconds(3600),
-				[]() { return saveFlag; });
-
-			//purposely woken up.
-			int proc_count = 5;
-			if (res)
-			{
-				while (enable_logging || tsq.GetQueueLen() > 0)
-				{
-					try
-					{
-						if (tsq.GetQueueLen() > 0)
-						{
-							//in blocked state until item is placed in queue.
-							auto dataTup = tsq.pop();
-
-							cv::Mat oImage; cv::Mat resImage; pcl::PointCloud<pcl::PointXYZ> pointCloud;
-							std::vector<uint16_t> distMap;
-							bool isJobLog = false; std::string msg;
-
-							oImage = std::get<0>(dataTup);
-							resImage = std::get<1>(dataTup);
-							pointCloud = std::get<2>(dataTup);
-							distMap = std::get<3>(dataTup);
-							isJobLog = std::get<4>(dataTup);
-							msg = std::get<5>(dataTup);
-							auto frameTime = std::get<6>(dataTup);
-
-							//bool save_res = save_to_drive(isJobLog, oImage, resImage, pointCloud, msg, frameTime);
-							bool save_res = save_to_drive_optimized(isJobLog, oImage, resImage, pointCloud, distMap, msg, frameTime);
-							if (!save_res) logMessage("Failed to save data to drive!");
-							else logMessage("[Data-Save-Thread] Data saved successfully for " + msg + " at " + time_as_name(frameTime));
-							//do not hug the process.
-							std::this_thread::sleep_for(std::chrono::milliseconds(25));
-						}
-					}
-					catch (std::exception& ex)
-					{
-						logMessage("[Data-Save-Thread] " + std::string(ex.what()));
-						std::this_thread::sleep_for(std::chrono::milliseconds(10));
-					}
-					catch (...)
-					{
-						logMessage("[Data-Save-Thread] Unknown Exception!");
-						std::this_thread::sleep_for(std::chrono::milliseconds(10));
-					}
-				}
+			// cloud is a pointer; dereference only when calling save
+			if (!task.cloud) {
+				logMessage("[Data-Save-Thread] Null cloud pointer, skipping.");
+				continue;
 			}
+
+			bool ok = save_to_drive(
+				task.isJobLog,
+				task.oImage,
+				task.resImage,
+				*task.cloud,
+				task.msg,
+				task.frameTime
+			);
+
+			if (!ok)
+				logMessage("[Data-Save-Thread] Failed to save data to drive!");
+			// Consider rate-limiting success logs if high FPS
+			// else logMessage("[Data-Save-Thread] Saved: " + task.msg);
+		}
+		catch (const std::exception& ex)
+		{
+			logMessage(std::string("[Data-Save-Thread] ") + ex.what());
+		}
+		catch (...)
+		{
+			logMessage("[Data-Save-Thread] Unknown Exception!");
 		}
 
-		logMessage("Data Logging Thread Deactivated");
+		// Optional: batch-drain a few queued items to reduce lock wakeups
+		for (int i = 0; i < 5 && logging_running.load(); ++i) {
+			SaveTask t2;
+			if (!tsq.try_pop(t2)) break;
+
+			try {
+				if (!t2.cloud) continue;
+				bool ok = save_to_drive(t2.isJobLog, t2.oImage, t2.resImage, *t2.cloud, t2.msg, t2.frameTime);
+				if (!ok) logMessage("[Data-Save-Thread] Failed to save data to drive!");
+			}
+			catch (...) {
+				logMessage("[Data-Save-Thread] Exception while batch saving.");
+			}
+		}
 	}
-	catch (std::exception& ex)
-	{
-		logMessage("[Data-Save-Thread] " + std::string(ex.what()));
-	}
-	catch (...)
-	{
-		logMessage("[Data-Save-Thread] Unknown Exception!");
-	}	
+
+	logMessage("Data Logging Thread Deactivated");
 }
 
 auto tmini_setup() -> bool
@@ -4783,7 +4822,7 @@ auto tmini_data_stream() -> void
 							if (true)
 							{
 								logMessage("Data stack updating stack with new data...");
-								auto res = dataStack.Update_Stack(grayToClr, *pclPointCloud, std::vector<uint16_t>(), last_frame_get_time);
+								auto res = dataStack.Update_Stack(grayToClr, *pclPointCloud, last_frame_get_time);
 								if (res) logMessage("Data Stack Updated Successfully!");
 								else logMessage("Data Stack Update Failed!");
 
@@ -7066,6 +7105,8 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 
 			//Try enhanced
 			cv::Mat enhanced_image = enhanceForYolo(image);
+			if (savePath != std::string("")) cv::imwrite(savePath + "_enhanced.jpg", enhanced_image);
+
 			int _det_count2 = 0;
 			std::vector<rectangle_info> _det_results2;
 			std::vector<std::vector<bbx>> _det_sorted_objects2(class_names.size(), std::vector<bbx>(0));
@@ -7486,7 +7527,7 @@ void processingThread()
 								std::chrono::system_clock::time_point last_ts, ts;
 
 								//logMessage("Retrieving stack data...");
-								auto r_status = dataStack.Retrieve_Stack(ref(img), ref(pointCloud), ref(distMap), ref(ts));
+								auto r_status = dataStack.Retrieve_Stack(ref(img), ref(pointCloud), ref(ts));
 								//if (r_status) logMessage("Stack data retrieved successfully!");
 								if (!r_status)
 								{
@@ -7520,22 +7561,16 @@ void processingThread()
 										std::string msg2 = save_trigger_by_landed ? "LANDED" : "LANDOFF";
 										msg = msg + std::string("_") + msg2;
 
-										auto dataTup = std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, bool, std::string, std::chrono::system_clock::time_point>(img, res_img, *pcPointCloud, distMap, true, msg, ts);
-										tsq.push(dataTup);
+										SaveTask dataTask(img, res_img, pcPointCloud, true, std::move(msg), ts);
+										tsq.push(std::move(dataTask));
 
 										if (save_trigger_by_landed) save_trigger_by_landed = false;
 										if (save_trigger_by_TWL_Locked) save_trigger_by_TWL_Locked = false;
 									}
 									else if (enable_logging)
 									{
-
-										//save data to queue with copied data.
-										cv::Mat saveMat = img.clone();
-										pcl::PointCloud<pcl::PointXYZ> savePointCloud;
-										pcl::copyPointCloud(pointCloud, savePointCloud);
-
-										auto dataTup = std::tuple<cv::Mat, cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, bool, std::string, std::chrono::system_clock::time_point>(saveMat, cv::Mat(), savePointCloud, distMap, false, "", last_frame_get_time);
-										tsq.push(dataTup);
+										SaveTask dataTask(img, cv::Mat(), pcPointCloud, false, std::string{}, last_frame_get_time);
+										tsq.push(std::move(dataTask));
 									}
 
 									current_process_results = ProcessLogic(CURRENT_SENSOR_POSITION, current_job_info, img, pcPointCloud, std::string(""), true, false, log_lines);
@@ -9048,7 +9083,7 @@ int main(int argc, char* argv[])
 
 	//YOLO11Detector detector (modelPath, labelsPath, useGPU);
 
-	yolo_detector.initialize(modelPath, labelsPath, useGPU);
+	yolo_detector.initialize(modelPath, labelsPath, useGPU, GPU_INDEX);
 	model_loaded = true;
 
 	std::string imagePath = app_path + "/sample.jpg";
@@ -9064,16 +9099,19 @@ int main(int argc, char* argv[])
 	{
 		std::string modelPath2 = app_path + "/" + enhance_model_path;
 
-		yolo_enhance_detector.initialize(modelPath, labelsPath, useGPU);
-		std::vector<Detection> detections = yolo_enhance_detector.detect(frame, confThreshold, iouThreshold);
+		std::cout << "Initializing YOLOv11 detector with model: " << modelPath2 << std::endl;
+		std::cout << "Classes file: " << labelsPath << std::endl;
+		std::cout << "Using confidence threshold: " << confThreshold << ", IoU threshold: " << iouThreshold << std::endl;
 
-		logMessage("Enhance model initialized with " + std::to_string(detections.size()) + " detections on sample image.");
+		yolo_enhance_detector.initialize(modelPath2, labelsPath, useGPU, GPU_INDEX);
+		std::vector<Detection> detections2 = yolo_enhance_detector.detect(frame, confThreshold, iouThreshold);
+
+		logMessage("Enhance model initialized with " + std::to_string(detections2.size()) + " detections on sample image.");
 	}
 
 	if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
 	{
 		//test();
-
 		OfflineDebugBatchProcessingThread();
 		//VA_model_Test();
 		//Enhance_image_dataset();

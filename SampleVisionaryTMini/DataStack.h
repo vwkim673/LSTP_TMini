@@ -57,7 +57,7 @@ class DataStack
 
         //Update
         //returns true if new data is updated to stack.
-        auto Update_Stack(cv::Mat image, pcl::PointCloud<pcl::PointXYZ> pointcloud, std::vector<uint16_t> distMap, std::chrono::system_clock::time_point ts) -> bool
+        auto Update_Stack(cv::Mat image, pcl::PointCloud<pcl::PointXYZ> pointcloud, std::chrono::system_clock::time_point ts) -> bool
         {
             bool update_status = false;
 
@@ -79,10 +79,9 @@ class DataStack
                             cv::Mat stack_image = image.clone(); // Use clone to avoid dangling reference
                             pcl::PointCloud<pcl::PointXYZ> stack_pointcloud;
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
-                            std::vector<uint16_t> stack_distMap = distMap;
                             
                             //Create tuple with data.
-                            d_tuple1 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
+                            d_tuple1 = std::make_tuple(stack_image, stack_pointcloud, ts);
 
                             isUsed1 = false;
                             isUpdated1 = true;
@@ -129,9 +128,8 @@ class DataStack
                             cv::Mat stack_image = image.clone(); // Use clone to avoid dangling reference
                             pcl::PointCloud<pcl::PointXYZ> stack_pointcloud;
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
-                            std::vector<uint16_t> stack_distMap = distMap;
                             //Create tuple with data.
-                            d_tuple2 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
+                            d_tuple2 = std::make_tuple(stack_image, stack_pointcloud, ts);
 
                             isUsed2 = false;
                             isUpdated2 = true;
@@ -181,9 +179,8 @@ class DataStack
                             cv::Mat stack_image = image.clone(); // Use clone to avoid dangling reference
                             pcl::PointCloud<pcl::PointXYZ> stack_pointcloud;
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
-                            std::vector<uint16_t> stack_distMap = distMap;
                             //Create tuple with data.
-                            d_tuple2 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
+                            d_tuple2 = std::make_tuple(stack_image, stack_pointcloud, ts);
 
                             isUsed2 = false;
                             isUpdated2 = true;
@@ -230,9 +227,8 @@ class DataStack
                             cv::Mat stack_image = image.clone(); // Use clone to avoid dangling reference
                             pcl::PointCloud<pcl::PointXYZ> stack_pointcloud;
                             pcl::copyPointCloud(pointcloud, stack_pointcloud); // Use copy to avoid dangling reference
-                            std::vector<uint16_t> stack_distMap = distMap;
                             //Create tuple with data.
-                            d_tuple1 = std::make_tuple(stack_image, stack_pointcloud, stack_distMap, ts);
+                            d_tuple1 = std::make_tuple(stack_image, stack_pointcloud, ts);
 
                             isUsed1 = false;
                             isUpdated1 = true;
@@ -273,7 +269,7 @@ class DataStack
         //Retrieve
         //returns true if unused recent data is returned.
         //returns false if no valid recent data is returned.
-        auto Retrieve_Stack(cv::Mat& image, pcl::PointCloud<pcl::PointXYZ>& pointcloud, std::vector<uint16_t>& distMap, std::chrono::system_clock::time_point& ts) -> bool
+        auto Retrieve_Stack(cv::Mat& image, pcl::PointCloud<pcl::PointXYZ>& pointcloud, std::chrono::system_clock::time_point& ts) -> bool
         {
             bool retrieve_status = false;
 
@@ -290,18 +286,11 @@ class DataStack
                             try
                             {
                                 isReading2 = true;
-
-                                //Copy data to reference objects.
-								cv::Mat stack_image = std::get<0>(d_tuple2);
-								pcl::PointCloud<pcl::PointXYZ> stack_pointcloud = std::get<1>(d_tuple2);
-                                std::vector<uint16_t> stack_distMap{};// = std::get<2>(d_tuple2);
-								std::chrono::system_clock::time_point stack_ts = std::get<3>(d_tuple2);
 								
                                 //Assign to output parameters.
-								image = stack_image.clone(); // Use clone to avoid dangling reference
-								pcl::copyPointCloud(stack_pointcloud, pointcloud); // Use copy to avoid dangling reference
-                                distMap = stack_distMap;
-								ts = stack_ts;
+								image = std::get<0>(d_tuple2).clone(); // Use clone to avoid dangling reference
+								pcl::copyPointCloud(std::get<1>(d_tuple2), pointcloud); // Use copy to avoid dangling reference
+								ts = std::get<2>(d_tuple2);
 
                                 //image = std::get<0>(d_tuple2);
                                 //pointcloud = std::get<1>(d_tuple2);
@@ -349,17 +338,10 @@ class DataStack
                             {
                                 isReading1 = true;
 
-                                //Copy data to reference objects.
-                                cv::Mat stack_image = std::get<0>(d_tuple1);
-                                pcl::PointCloud<pcl::PointXYZ> stack_pointcloud = std::get<1>(d_tuple1);
-                                std::vector<uint16_t> stack_distMap = std::get<2>(d_tuple1);
-                                std::chrono::system_clock::time_point stack_ts = std::get<3>(d_tuple1);
-
                                 //Assign to output parameters.
-                                image = stack_image.clone(); // Use clone to avoid dangling reference
-                                pcl::copyPointCloud(stack_pointcloud, pointcloud); // Use copy to avoid dangling reference
-                                distMap = stack_distMap;
-                                ts = stack_ts;
+                                image = std::get<0>(d_tuple1).clone(); // Use clone to avoid dangling reference
+                                pcl::copyPointCloud(std::get<1>(d_tuple1), pointcloud); // Use copy to avoid dangling reference                             
+                                ts = std::get<2>(d_tuple1);
 
                                 isUsed1 = true;
                                 isUpdated1 = false;
@@ -387,7 +369,6 @@ class DataStack
                         //put empty data.
                         image = cv::Mat();
                         pointcloud = pcl::PointCloud<pcl::PointXYZ>();
-                        distMap = std::vector<uint16_t>();
                         ts = std::chrono::system_clock::now();
                         retrieve_status = false;
                     }
@@ -407,17 +388,10 @@ class DataStack
                             {
                                 isReading1 = true;
 
-                                //Copy data to reference objects.
-                                cv::Mat stack_image = std::get<0>(d_tuple1);
-                                pcl::PointCloud<pcl::PointXYZ> stack_pointcloud = std::get<1>(d_tuple1);
-                                std::vector<uint16_t> stack_distMap = std::get<2>(d_tuple1);
-                                std::chrono::system_clock::time_point stack_ts = std::get<3>(d_tuple1);
-
                                 //Assign to output parameters.
-                                image = stack_image.clone(); // Use clone to avoid dangling reference
-                                pcl::copyPointCloud(stack_pointcloud, pointcloud); // Use copy to avoid dangling reference
-                                distMap = stack_distMap;
-                                ts = stack_ts;
+                                image = std::get<0>(d_tuple1).clone(); // Use clone to avoid dangling reference
+                                pcl::copyPointCloud(std::get<1>(d_tuple1), pointcloud); // Use copy to avoid dangling reference                             
+                                ts = std::get<2>(d_tuple1);
 
                                 isUsed1 = true;
                                 isUpdated1 = false;
@@ -445,7 +419,6 @@ class DataStack
                         //put empty data.
                         image = cv::Mat();
                         pointcloud = pcl::PointCloud<pcl::PointXYZ>();
-                        distMap = std::vector<uint16_t>();
                         ts = std::chrono::system_clock::now();
                         retrieve_status = false;
                     }
@@ -462,17 +435,11 @@ class DataStack
                             {
                                 isReading2 = true;
 
-                                //Copy data to reference objects.
-                                cv::Mat stack_image = std::get<0>(d_tuple2);
-                                pcl::PointCloud<pcl::PointXYZ> stack_pointcloud = std::get<1>(d_tuple2);
-                                std::vector<uint16_t> stack_distMap = std::get<2>(d_tuple2);
-                                std::chrono::system_clock::time_point stack_ts = std::get<3>(d_tuple2);
-
                                 //Assign to output parameters.
-                                image = stack_image.clone(); // Use clone to avoid dangling reference
-                                pcl::copyPointCloud(stack_pointcloud, pointcloud); // Use copy to avoid dangling reference
-                                distMap = stack_distMap;
-                                ts = stack_ts;
+                                image = std::get<0>(d_tuple2).clone(); // Use clone to avoid dangling reference
+                                pcl::copyPointCloud(std::get<1>(d_tuple2), pointcloud); // Use copy to avoid dangling reference
+                                //distMap = stack_distMap;
+                                ts = std::get<2>(d_tuple2);;
 
                                 isUsed2 = true;
                                 isUpdated2 = false;
@@ -500,7 +467,6 @@ class DataStack
                          //put empty data.
                          image = cv::Mat();
                          pointcloud = pcl::PointCloud<pcl::PointXYZ>();
-                         distMap = std::vector<uint16_t>();
                          ts = std::chrono::system_clock::now();
                          retrieve_status = false;
                     }
@@ -512,8 +478,8 @@ class DataStack
 
         auto Clear_Stack() -> void
         {
-            d_tuple1 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point>();
-            d_tuple2 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point>();
+            d_tuple1 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point>();
+            d_tuple2 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point>();
 
             isEmpty1 = true;
             isEmpty2 = true;
@@ -536,376 +502,8 @@ class DataStack
         std::atomic<int> newStack_i = 1;
         std::atomic<bool> isAvailable1 = false, isAvailable2 = false;
  
-        std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point> d_tuple1 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point>();
-        std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point> d_tuple2 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::vector<uint16_t>, std::chrono::system_clock::time_point>();
+        std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point> d_tuple1 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point>();
+        std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>, std::chrono::system_clock::time_point> d_tuple2 = std::tuple<cv::Mat, pcl::PointCloud<pcl::PointXYZ>,  std::chrono::system_clock::time_point>();
 
         std::mutex mtx1, mtx2;
-};
-class DataStack_RGB
-{
-public:
-    DataStack_RGB() = default;
-    ~DataStack_RGB() = default;
-
-    //Update
-    //returns true if new data is updated to stack.
-    auto Update_Stack(cv::Mat image, std::chrono::system_clock::time_point ts) -> bool
-    {
-        bool update_status = false;
-        std::tuple<cv::Mat, std::chrono::system_clock::time_point> dTuple = std::make_tuple(image,ts);
-
-        //last updated is 1.
-        if (newStack_i == 1)
-        {
-            //If currently data is retrieving data from stack2,
-            if (isReading2)
-            {
-                //Update1 again.make_tuple
-                try
-                {
-                    std::lock_guard<std::mutex> lock(mtx1);
-                    try
-                    {
-                        isWriting1 = true;
-
-                        d_tuple1 = dTuple;
-
-                        isUsed1 = false;
-                        isUpdated1 = true;
-
-                        newStack_i = 1;
-
-                        update_status = true;
-                        //std::cout << "Updated Stack1 because stack2 is being read : " << std::to_string(newStack_i) << std::endl;
-
-                        isWriting1 = false;
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                catch (system_error& e)
-                {
-                    //deadlock?
-                    std::cerr << e.what() << '\n';
-                }
-                catch (...)
-                {
-                    //deadlock unknown error
-                    std::cout << print_time2() << " unknown error from write mutex lock" << std::endl;
-                }
-            }
-            else
-            {
-                //Update2.
-                try
-                {
-                    std::lock_guard<std::mutex> lock(mtx2);
-                    try
-                    {
-                        isWriting2 = true;
-
-                        d_tuple2 = dTuple;
-
-                        isUsed2 = false;
-                        isUpdated2 = true;
-
-                        newStack_i = 2;
-
-                        update_status = true;
-                        //std::cout << "Updated Stack2 : " << std::to_string(newStack_i) << std::endl;
-
-                        isWriting2 = false;
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                catch (system_error& e)
-                {
-                    //deadlock?
-                    std::cerr << e.what() << '\n';
-                }
-                catch (...)
-                {
-                    //deadlock unknown error
-                    std::cout << print_time2() << " unknown error from write mutex lock" << std::endl;
-                }
-            }
-        }
-        else
-        {
-            if (isReading1)
-            {
-                //Update2 again.
-                try
-                {
-                    std::lock_guard<std::mutex> lock(mtx2);
-                    try
-                    {
-                        isWriting2 = true;
-
-                        d_tuple2 = dTuple;
-
-                        isUsed2 = false;
-                        isUpdated2 = true;
-
-                        newStack_i = 2;
-
-                        update_status = true;
-                        //std::cout << "Updated Stack2 because stack1 is being read : " << std::to_string(newStack_i) << std::endl;
-
-                        isWriting2 = false;
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                catch (system_error& e)
-                {
-                    //deadlock?
-                    std::cerr << e.what() << '\n';
-                }
-                catch (...)
-                {
-                    //deadlock unknown error
-                    std::cout << "unknown error from write mutex lock" << std::endl;
-                }
-            }
-            else
-            {
-                //Update1.
-                try
-                {
-                    std::lock_guard<std::mutex> lock(mtx1);
-                    try
-                    {
-                        isWriting1 = true;
-
-                        d_tuple1 = dTuple;
-
-                        isUsed1 = false;
-                        isUpdated1 = true;
-
-                        newStack_i = 1;
-
-                        update_status = true;
-                        //std::cout << "Updated Stack1 : " << std::to_string(newStack_i) << std::endl;
-
-                        isWriting1 = false;
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                catch (system_error& e)
-                {
-                    //deadlock?
-                    std::cerr << e.what() << '\n';
-                }
-                catch (...)
-                {
-                    //deadlock unknown error
-                    std::cout << "unknown error from write mutex lock" << std::endl;
-                }
-            }
-        }
-
-        return update_status;
-    }
-
-    //Retrieve
-    //returns true if unused recent data is returned.
-    //returns false if no valid recent data is returned.
-    auto Retrieve_Stack(cv::Mat& image, std::chrono::system_clock::time_point& ts) -> bool
-    {
-        bool retrieve_status = false;
-
-        if (newStack_i == 1)
-        {
-            if (isWriting1)
-            {
-                //read from stack 2.
-                if (!isUsed2)
-                {
-                    try
-                    {
-                        std::lock_guard<std::mutex> lg(mtx2);
-                        try
-                        {
-                            isReading2 = true;
-
-                            image = std::get<0>(d_tuple2);
-                            ts = std::get<1>(d_tuple2);
-
-                            isUsed2 = true;
-                            retrieve_status = true;
-
-                            //std::cout <<  print_time2() << " Reading from stack2" << std::endl;
-
-                            isReading2 = false;
-                        }
-                        catch (const std::exception& e)
-                        {
-                            std::cerr << e.what() << '\n';
-                        }
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                else
-                {
-                    std::cout << "Can't read from both stack 1 and 2" << std::endl;
-                }
-            }
-            else
-            {
-                //Read from stack 1.
-                if (!isUsed1)
-                {
-                    try
-                    {
-                        std::lock_guard<std::mutex> lg(mtx1);
-                        try
-                        {
-                            isReading1 = true;
-
-                            image = std::get<0>(d_tuple1);
-                            ts = std::get<1>(d_tuple1);
-
-                            isUsed1 = true;
-                            retrieve_status = true;
-
-                            //std::cout <<  print_time2() << " Reading from stack1" << std::endl;
-
-                            isReading1 = false;
-                        }
-                        catch (const std::exception& e)
-                        {
-                            std::cerr << e.what() << '\n';
-                        }
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                else
-                {
-                    ;
-                }
-            }
-        }
-        else
-        {
-            if (isWriting2)
-            {
-                //read from stack 1.
-                if (!isUsed1)
-                {
-                    try
-                    {
-                        std::lock_guard<std::mutex> lg(mtx1);
-                        try
-                        {
-                            isReading1 = true;
-
-                            image = std::get<0>(d_tuple1);
-                            ts = std::get<1>(d_tuple1);
-
-                            isUsed1 = true;
-                            retrieve_status = true;
-
-                            //std::cout <<  print_time2() << " Reading from stack1" << std::endl;
-
-                            isReading1 = false;
-                        }
-                        catch (const std::exception& e)
-                        {
-                            std::cerr << e.what() << '\n';
-                        }
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                else
-                {
-                    std::cout << "Can't read from both stack 1 and 2" << std::endl;
-                }
-            }
-            else
-            {
-                //Read from stack 2.
-                if (!isUsed2)
-                {
-                    try
-                    {
-                        std::lock_guard<std::mutex> lg(mtx2);
-                        try
-                        {
-                            isReading2 = true;
-
-                            image = std::get<0>(d_tuple2);
-                            ts = std::get<1>(d_tuple2);
-
-                            isUsed2 = true;
-                            retrieve_status = true;
-
-                            //std::cout <<  print_time2() << " Reading from stack2" << std::endl;
-
-                            isReading2 = false;
-                        }
-                        catch (const std::exception& e)
-                        {
-                            std::cerr << e.what() << '\n';
-                        }
-                    }
-                    catch (const std::exception& e)
-                    {
-                        std::cerr << e.what() << '\n';
-                    }
-                }
-                else
-                {
-                    ;
-                }
-            }
-        }
-
-        return retrieve_status;
-    }
-
-    auto Clear_Stack() -> void
-    {
-        d_tuple1 = std::tuple<cv::Mat, std::chrono::system_clock::time_point>();
-        d_tuple2 = std::tuple<cv::Mat, std::chrono::system_clock::time_point>();
-
-        isEmpty1 = true;
-        isEmpty2 = true;
-        isAvailable1 = false;
-        isAvailable2 = false;
-    }
-
-
-private:
-    bool isReading1 = false, isReading2 = false;
-    bool isWriting1 = false, isWriting2 = false;
-    bool isUsed1 = false, isUsed2 = false;
-    bool isUpdated1 = false, isUpdated2 = false;
-    bool isEmpty1 = true, isEmpty2 = true;
-    int newStack_i = 1;
-    bool isAvailable1 = false, isAvailable2 = false;
-
-    std::tuple<cv::Mat, std::chrono::system_clock::time_point> d_tuple1 = std::tuple<cv::Mat, std::chrono::system_clock::time_point>();
-    std::tuple<cv::Mat, std::chrono::system_clock::time_point> d_tuple2 = std::tuple<cv::Mat, std::chrono::system_clock::time_point>();
-
-    std::mutex mtx1, mtx2;
 };

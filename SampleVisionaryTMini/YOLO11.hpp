@@ -554,7 +554,7 @@ public:
 
     YOLO11Detector() = default;
 
-    void initialize(const std::string& modelPath, const std::string& labelsPath, bool useGPU = false);
+    void initialize(const std::string& modelPath, const std::string& labelsPath, bool useGPU = false, int gpu_index=0);
 
     /**
      * @brief Constructor to initialize the YOLO detector with model and label paths.
@@ -643,7 +643,7 @@ private:
 };
 
 
-void YOLO11Detector::initialize(const std::string& modelPath, const std::string& labelsPath, bool useGPU) {
+void YOLO11Detector::initialize(const std::string& modelPath, const std::string& labelsPath, bool useGPU, int gpuIndex) {
     // Initialize ONNX Runtime environment with warning level
     env = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "ONNX_DETECTION");
     sessionOptions = Ort::SessionOptions();
@@ -656,11 +656,14 @@ void YOLO11Detector::initialize(const std::string& modelPath, const std::string&
     // Retrieve available execution providers (e.g., CPU, CUDA)
     std::vector<std::string> availableProviders = Ort::GetAvailableProviders();
     auto cudaAvailable = std::find(availableProviders.begin(), availableProviders.end(), "CUDAExecutionProvider");
-    OrtCUDAProviderOptions cudaOption;
+   
 
     // Configure session options based on whether GPU is to be used and available
     if (useGPU && cudaAvailable != availableProviders.end()) {
-        std::cout << "Inference device: GPU" << std::endl;
+        OrtCUDAProviderOptions cudaOption{};
+		cudaOption.device_id = gpuIndex; // Set the GPU device index for CUDA execution provider
+
+        std::cout << "Inference device: GPU (device_id=" << gpuIndex << ")\n";
         sessionOptions.AppendExecutionProvider_CUDA(cudaOption); // Append CUDA execution provider
     }
     else {
