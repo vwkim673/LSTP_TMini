@@ -150,7 +150,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.7T1";
+const std::string program_version = "1.8";
 
 std::vector<std::string> class_names = { "HOLE", "CONE", "LANDED", "GUIDE" };
 
