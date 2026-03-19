@@ -150,7 +150,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.7";
+const std::string program_version = "1.7T1";
 
 std::vector<std::string> class_names = { "HOLE", "CONE", "LANDED", "GUIDE" };
 
@@ -4773,9 +4773,37 @@ auto tmini_data_stream() -> void
 							//logMessage("DistMap: " + std::to_string(distMap.size()));
 
 							auto intensityMap = pDataHandler->getIntensityMap();
+							auto depthMap = pDataHandler->getDistanceMap();
 
 							auto iW = pDataHandler->getWidth();
 							auto iH = pDataHandler->getHeight();
+
+							/*
+							//New Data. -- Need Collection.
+							// 
+							// // 2. 16비트 Raw Matrix 생성
+							cv::Mat matIntensity16 = cv::Mat(iH, iW, CV_16UC1, intensityMap.data());
+							cv::Mat matDepth16 = cv::Mat(iH, iW, CV_16UC1, depthMap.data());
+
+							cv::Mat ch1_intensity, ch2_depth, ch3_gradient;
+							
+							// Intensity cap to 0~255
+							matIntensity16.convertTo(ch1_intensity, CV_8UC1, 255.0 / 4095.0); // 센서 비트심도에 따라 조절
+
+							//5m range to 0-255 scaling
+							// 1/4mm unit -> 5000mm is 20000 in sensor value, so we scale 20000 to 255.
+							matDepth16.convertTo(ch2_depth, CV_8UC1, 255.0 / 20000.0);
+
+							cv::Mat gradX, gradY;
+							cv::Sobel(ch2_depth, gradX, CV_16S, 1, 0);
+							cv::Sobel(ch2_depth, gradY, CV_16S, 0, 1);
+							cv::convertScaleAbs(gradX + gradY, ch3_gradient); // 절댓값 합산 후 8비트 변환
+
+							std::vector<cv::Mat> channels = { ch1_intensity, ch2_depth, ch3_gradient };
+							cv::Mat im3_final;
+							cv::merge(channels, im3_final);
+							*/
+
 							auto gImg = cv::Mat(pDataHandler->getHeight(), pDataHandler->getWidth(), CV_16UC1, intensityMap.data());
 							cv::Mat im3; // I want im3 to be the CV_16UC1 of im2
 							gImg.convertTo(im3, CV_8UC1);
@@ -6711,7 +6739,7 @@ bool CLPS_Detection_PCA(pcl::PointCloud<pcl::PointXYZ>::Ptr pointCloud, bool isL
 
 					pcUnderHole = pcTargetBase->points.size();
 
-					if (pcTargetBase->points.size() > 1300)
+					if (pcTargetBase->points.size() > 1100)
 					{
 						if (clps_current_count_pca < CLPS_NCOUNT) clps_current_count_pca++;
 						else
@@ -7086,32 +7114,33 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 		cv::Mat res_image = image.clone();
 		cv::Mat res_image2 = image.clone();
 
+		cv::Mat enhanced_image = enhanceForYolo(image);
+
 		int _det_count = 0;
 		std::vector<rectangle_info> _det_results;
 		std::vector<std::vector<bbx>> _det_sorted_objects(class_names.size(), std::vector<bbx>(0));
 
 		auto inference_time = std::chrono::high_resolution_clock::now();
-		auto inference_status = yolo_inference(yolo_detector, OP_SENSOR_POS, image, ref(res_image), ref(_det_results), ref(_det_sorted_objects), ref(_det_count), savePath);
+		auto inference_status = yolo_inference(yolo_enhance_detector, OP_SENSOR_POS, enhanced_image, ref(res_image), ref(_det_results), ref(_det_sorted_objects), ref(_det_count), savePath);
+		enhanceUsed = true;
 		auto inference_Endtime = std::chrono::high_resolution_clock::now();
 		auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_Endtime - inference_time);
-		logMessage("VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
-		if (jobLog) jobLogMessage("VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
+		//logMessage("VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
+		//if (jobLog) jobLogMessage("VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
 
 		//Stage-2: enhanced image inference if needed.
 		bool coneDetected = (_det_sorted_objects[1].size() > 0 || _det_sorted_objects[2].size() > 0); //cone or landed detected from stage-1.
-		if (!coneDetected && VA_ENABLE_ENHANCE)
+		if ((!coneDetected && VA_ENABLE_ENHANCE) || debugMode)
 		{
-			logMessage("Staging for enhanced image inference as cone/landed is not detected from stage-1.");
+			logMessage("No valid results, trying inference on original image.");
 
-			//Try enhanced
-			cv::Mat enhanced_image = enhanceForYolo(image);
-			if (savePath != std::string("")) cv::imwrite(savePath + "_enhanced.jpg", enhanced_image);
+			//if (savePath != std::string("")) cv::imwrite(savePath + "_enhanced.jpg", enhanced_image);
 
 			int _det_count2 = 0;
 			std::vector<rectangle_info> _det_results2;
 			std::vector<std::vector<bbx>> _det_sorted_objects2(class_names.size(), std::vector<bbx>(0));
 
-			auto inference_status2 = yolo_inference(yolo_enhance_detector, OP_SENSOR_POS, enhanced_image, ref(res_image2), ref(_det_results2), ref(_det_sorted_objects2), ref(_det_count2), savePath);
+			auto inference_status2 = yolo_inference(yolo_detector, OP_SENSOR_POS, image, ref(res_image2), ref(_det_results2), ref(_det_sorted_objects2), ref(_det_count2), savePath);
 
 			if (_det_count2 > 0)
 			{
@@ -7124,8 +7153,6 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 						_det_count++;
 					}
 				}
-
-				enhanceUsed = true;
 			}
 		}
 
@@ -7402,7 +7429,8 @@ ProcessResults ProcessLogic(std::string OP_SENSOR_POS, JobInfo JOB_INFO, const c
 				else cv::putText(res_image, std::string("LANDOUT_PCA:FALSE"), cv::Point(0, 170), cv::FONT_HERSHEY_SIMPLEX, 1, cv::Scalar(0, 0, 255), 2);
 			}
 
-			if (savePath != std::string("")) cv::imwrite(savePath + "_result.jpg", res_image);
+			if (savePath != std::string("")) cv::imwrite(savePath + "_enhance_result.jpg", res_image);
+			if (savePath != std::string("")) cv::imwrite(savePath + "_result.jpg", res_image2);
 		}
 		//Update to Current Processing Result.
 
@@ -7927,7 +7955,6 @@ void Enhance_image_dataset()
 
 		logMessage("Saving to " + save_file_path);
 		for (int i = 0; i < image_files.size(); i++)
-
 		{
 			logMessage("Processing Cycle Start!");
 
@@ -7959,7 +7986,7 @@ void Enhance_image_dataset()
 			auto t_dur_enhance = std::chrono::duration_cast<std::chrono::milliseconds>(t_stop_enhance - t_start_enhance).count();
 			logMessage("Image enhance time in ms: " + std::to_string(t_dur_enhance) + "ms");
 
-			if (!enhanced_image.empty()) cv::imwrite(save_current_file_path + "/" + filename + ".jpg", enhanced_image);
+			if (!enhanced_image.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced.jpg", enhanced_image);
 		}
 	}
 }
@@ -8023,13 +8050,32 @@ void VA_model_Test()
 			// Get the filename with extension
 			std::string filename = pathObj.stem().string();
 
+			bool isLeftSensor = false;
+			std::string SENSOR_POS = "REAR_RIGHT";
+			//20251226_150804_053_TMini_RR_Image
+			std::vector<std::string> name_parts = split(filename, '_');
+			if (name_parts.size() > 5)
+			{
+				if (name_parts[4] == "RL")
+				{
+					isLeftSensor = true;
+					SENSOR_POS = "REAR_LEFT";
+				}
+			}
+
 			std::string log_lines = filename + ";";
 
-			//folder for each file
-			auto save_current_file_path = save_file_path + "/" + filename;
-			createDirectory_ifexists(save_current_file_path);
+			//folder for original, enhanced images that cone is missing.
 
-			std::string save_path = save_current_file_path + "/" + filename;
+			auto save_original_file_path = save_file_path + "/Original";
+			auto save_enhanced_file_path = save_file_path + "/Enhanced";
+			createDirectory_ifexists(save_original_file_path);
+			createDirectory_ifexists(save_enhanced_file_path);
+
+			//auto save_current_file_path = save_file_path + "/" + filename;
+			//createDirectory_ifexists(save_current_file_path);
+
+			//std::string save_path = save_current_file_path + "/" + filename;
 
 			//load image
 			cv::Mat image = cv::imread(image_files.at(i));
@@ -8047,26 +8093,26 @@ void VA_model_Test()
 			auto t_dur_enhance = std::chrono::duration_cast<std::chrono::milliseconds>(t_stop_enhance - t_start_enhance).count();
 			logMessage("Image enhance time in ms: " + std::to_string(t_dur_enhance) + "ms");
 
-			if (!enhanced_image.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced.jpg", enhanced_image);
+			//if (!enhanced_image.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced.jpg", enhanced_image);
 
 			res_image1 = image.clone();
 			res_image2 = enhanced_image.clone();
 
-			bool isLeftSensor = false;
-			if (DEBUG_SENSOR_POSITION.find("LEFT") != std::string::npos)
-			{
-				isLeftSensor = true;
-			}
+			//bool isLeftSensor = false;
+			//if (DEBUG_SENSOR_POSITION.find("LEFT") != std::string::npos)
+			//{
+			//	isLeftSensor = true;
+			//}
 
-			std::string savePath1 = save_current_file_path + "/" + filename;
-			std::string savePath2 = save_current_file_path + "/" + filename + "_enhanced";
+			//std::string savePath1 = save_current_file_path + "/" + filename;
+			//std::string savePath2 = save_current_file_path + "/" + filename + "_enhanced";
 
 			int _det_count1 = 0;
 			std::vector<rectangle_info> _det_results1;
 			std::vector<std::vector<bbx>> _det_sorted_objects1(class_names.size(), std::vector<bbx>(0));
 
 			auto inference_time = std::chrono::high_resolution_clock::now();
-			auto inference_status = yolo_inference(original_detector, DEBUG_SENSOR_POSITION, image, ref(res_image1), ref(_det_results1), ref(_det_sorted_objects1), ref(_det_count1), savePath1);
+			auto inference_status = yolo_inference(original_detector, SENSOR_POS, image, ref(res_image1), ref(_det_results1), ref(_det_sorted_objects1), ref(_det_count1), std::string(""));
 			auto inference_Endtime = std::chrono::high_resolution_clock::now();
 			auto inference_duration = std::chrono::duration_cast<std::chrono::milliseconds>(inference_Endtime - inference_time);
 			logMessage("Original VA Inference Time= " + std::to_string(inference_duration.count()) + "ms");
@@ -8076,13 +8122,13 @@ void VA_model_Test()
 			std::vector<std::vector<bbx>> _det_sorted_objects2(class_names.size(), std::vector<bbx>(0));
 
 			auto inference_time2 = std::chrono::high_resolution_clock::now();
-			auto inference_status2 = yolo_inference(updated_detector, DEBUG_SENSOR_POSITION, enhanced_image, ref(res_image2), ref(_det_results2), ref(_det_sorted_objects2), ref(_det_count2), savePath2);
+			auto inference_status2 = yolo_inference(updated_detector, SENSOR_POS, enhanced_image, ref(res_image2), ref(_det_results2), ref(_det_sorted_objects2), ref(_det_count2), std::string(""));
 			auto inference_Endtime2 = std::chrono::high_resolution_clock::now();
 			auto inference_duration2 = std::chrono::duration_cast<std::chrono::milliseconds>(inference_Endtime2 - inference_time2);
 			logMessage("Updated VA Inference Time= " + std::to_string(inference_duration2.count()) + "ms");
 
-			if (!res_image1.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_original_res.jpg", res_image1);
-			if (!res_image2.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced_res.jpg", res_image2);
+			//if (!res_image1.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_original_res.jpg", res_image1);
+			//if (!res_image2.empty()) cv::imwrite(save_current_file_path + "/" + filename + "_enhanced_res.jpg", res_image2);
 
 			bool holeDetected1 = (_det_sorted_objects1[0].size() > 0);
 			bool holeDetected2 = (_det_sorted_objects2[0].size() > 0);
@@ -8109,6 +8155,13 @@ void VA_model_Test()
 			log_lines += std::string(hole1_not2 ? "1" : "0") + ";" + std::string(hole2_not1 ? "1" : "0") + ";" + std::string(cone1_not2 ? "1" : "0") + ";" + std::string(cone2_not1 ? "1" : "0") + ";";
 			
 			log_lines += std::string(holeDetected1 ? "1" : "0") + ";" + std::string(holeDetected2 ? "1" : "0") + ";" + std::string(coneDetected1 ? "1" : "0") + ";" + std::string(coneDetected2 ? "1" : "0");
+
+			if (!cone_both_detected)
+			{
+				cv::imwrite(save_original_file_path + "/" + filename + "_original.jpg", image);
+				cv::imwrite(save_enhanced_file_path + "/" + filename + "_enhanced.jpg", enhanced_image);
+			}
+
 
 			Simfile_batch.open(sim_batch_result_txt.c_str(), ios::out | ios::app);
 			if (!Simfile_batch.is_open())
@@ -9112,6 +9165,7 @@ int main(int argc, char* argv[])
 	if (DEBUG_WITH_FILES || DEBUG_BATCH_JOB)
 	{
 		//test();
+		//VA_model_Test();
 		OfflineDebugBatchProcessingThread();
 		//VA_model_Test();
 		//Enhance_image_dataset();
