@@ -150,7 +150,7 @@ const float iouThreshold = 0.45f;   // Match Ultralytics default IoU threshold
 *	Added CLPS OK (chassis-container separation detection logic)
 */
 
-const std::string program_version = "1.8";
+const std::string program_version = "1.9";
 
 std::vector<std::string> class_names = { "HOLE", "CONE", "LANDED", "GUIDE" };
 
@@ -563,6 +563,10 @@ int CLPS_Current_Count = 0;
 int CLPS_OK_Current_Count = 0;
 
 int target_lane_number = 1;
+int block_number = 1;
+
+int fixed_block_number_on_job = 1;
+int fixed_lane_number_on_job = 1;
 
 int devOut_x, devOut_y;
 int devOut_LDO_x, devOut_LDO_y;
@@ -1819,7 +1823,9 @@ std::string makeJobFolderName()
 
 	//2025.08.22 added target lane number
 
-	job_info.append(std::to_string(target_lane_number) + "_");
+	job_info.append("L" + std::to_string(target_lane_number) + "_");
+
+	job_info.append("B" + std::to_string(block_number) + "_");
 
 	job_info.append(appName);
 
@@ -1950,6 +1956,18 @@ void parseCommand(char recvbuf[])
 		}
 
 		{
+			std::bitset<8> byte22(recvBuf[22]);
+			std::bitset<8> byte23(recvBuf[23]);
+			std::bitset<16> temp = concat(byte22, byte23);
+			auto tempVal = bitset_to_long(temp);
+			if (tempVal != block_number)
+			{
+				logMessage("Block Number set to: " + std::to_string(block_number) + " to " + std::to_string(tempVal));
+			}
+			block_number = tempVal;
+		}
+
+		{
 			std::bitset<8> byte18(recvBuf[18]);
 			enable_stream = (bool)byte18[0];
 			
@@ -1993,6 +2011,10 @@ void parseCommand(char recvbuf[])
 
 				job_name = makeJobFolderName();
 				logMessage("Job: " + job_name);
+
+				fixed_block_number_on_job = block_number;
+				fixed_lane_number_on_job = target_lane_number;
+
 				job_result_folder_name.append(job_name);
 				job_result_folder_name.append("_JOBLOG");
 				createDirectory_ifexists(job_result_folder_name);
@@ -4408,8 +4430,8 @@ bool save_to_drive(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pcl::PointCl
 			std::string pos = "RL";
 			if (CURRENT_SENSOR_POSITION == "REAR_RIGHT") pos = "RR";
 
-			if (!oImage.empty()) cv::imwrite(SaveOImageDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_oImage.jpg", oImage);
-			if (!resImage.empty()) cv::imwrite(SaveResImageDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_resImage.jpg", resImage);
+			if (!oImage.empty()) cv::imwrite(SaveOImageDir + "/" + timeNow + "_" + msg + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_oImage.jpg", oImage);
+			if (!resImage.empty()) cv::imwrite(SaveResImageDir + "/" + timeNow + "_" + msg + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_resImage.jpg", resImage);
 
 			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_Depth.pcd";
 			if (pointCloud.points.size() > 0) pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);
@@ -4424,10 +4446,10 @@ bool save_to_drive(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pcl::PointCl
 			std::string pos = "RL";
 			if (CURRENT_SENSOR_POSITION == "REAR_RIGHT") pos = "RR";
 
-			if (!oImage.empty()) cv::imwrite(SaveImageDir + "/" + timeNow + "_TMini_" + pos + "_Image.jpg", oImage);
+			if (!oImage.empty()) cv::imwrite(SaveImageDir + "/" + timeNow + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_Image.jpg", oImage);
 			//-----------------------------------------------
 			// Write point cloud to PLY
-			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_TMini_" + pos + "_Depth.pcd";
+			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_Depth.pcd";
 			if (pointCloud.points.size() > 0) pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);
 			//std::printf("Writing frame to %s\n", plyFilePath);
 			//PointCloudPlyWriter::WriteFormatPLY(plyFilePath.c_str(), pointCloud, intensityMap, true);
@@ -4463,11 +4485,10 @@ bool save_to_drive_optimized(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pc
 			std::string pos = "RL";
 			if (CURRENT_SENSOR_POSITION == "REAR_RIGHT") pos = "RR";
 
-			if (!oImage.empty()) cv::imwrite(SaveOImageDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_oImage.jpg", oImage);
-			if (!resImage.empty()) cv::imwrite(SaveResImageDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_resImage.jpg", resImage);
+			if (!oImage.empty()) cv::imwrite(SaveOImageDir + "/" + timeNow + "_" + msg + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_oImage.jpg", oImage);
+			if (!resImage.empty()) cv::imwrite(SaveResImageDir + "/" + timeNow + "_" + msg + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_resImage.jpg", resImage);
 			
-
-			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_" + msg + "_TMini_" + pos + "_Depth.pcd";
+			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_" + msg + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_Depth.pcd";
 			//if (pointCloud.points.size() > 0) pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);
 			if (pointCloud.points.size() > 0) pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);
 			//if (pointCloud.points.size() > 0) save_cloud_pcd_compressed_zstd(plyFilePath.c_str(), pointCloud);
@@ -4487,10 +4508,10 @@ bool save_to_drive_optimized(bool isJobLog, cv::Mat oImage, cv::Mat resImage, pc
 			std::string pos = "RL";
 			if (CURRENT_SENSOR_POSITION == "REAR_RIGHT") pos = "RR";
 
-			if (!oImage.empty()) cv::imwrite(SaveImageDir + "/" + timeNow + "_TMini_" + pos + "_Image.jpg", oImage);
+			if (!oImage.empty()) cv::imwrite(SaveImageDir + "/" + timeNow + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_Image.jpg", oImage);
 			//-----------------------------------------------
 			// Write point cloud to PLY
-			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_TMini_" + pos + "_Depth.pcd";
+			std::string plyFilePath = SaveDepthDir + "/" + timeNow + "_B" + std::to_string(fixed_block_number_on_job) + "_L" + std::to_string(fixed_lane_number_on_job) + "_TMini_" + pos + "_Depth.pcd";
 			if (pointCloud.points.size() > 0)
 			{
 				pcl::io::savePCDFileBinaryCompressed(plyFilePath.c_str(), pointCloud);
@@ -5762,8 +5783,9 @@ bool CLPS_Detection_VA(bool OffloadJob, bbx target_hole, bbx target_cone, bool s
 				//if valid cornercastings and cone (label==1) detected, then clps-ok.
 				if (target_hole.prob > 70 && (target_cone.prob > 70 && target_cone.label == 1))
 				{
-					auto diff_hc_y = target_cone.center_y - target_hole.center_y;
-					if (diff_hc_y > 20)
+					//auto diff_hc_y = target_cone.center_y - target_hole.center_y;
+					auto diff_hc_y = target_hole.center_y - (target_cone.center_y + target_cone.h); //check if cone is below the hole.
+					if (diff_hc_y > 8) //7mm/pixel -> 50mm (~8 pixels) gap should trigger this. Else, CLPS detected from above logic.
 					{
 						if ((diff_y > CLPS_NEAR_Y_THRESHOLD && diff_x < CLPS_NEAR_X_THRESHOLD) || (LowerBound_diff_x < CLPS_LOWER_X_THRESHOLD && LowerBound_diff_y > CLPS_LOWER_Y_THRESHOLD && labelMatched))
 						{
@@ -7994,11 +8016,13 @@ void Enhance_image_dataset()
 //Inference difference Test
 void VA_model_Test()
 {
-	std::string modelPath1 = app_path + "/model/20250723_LSTP_TMINI.onnx";
-	std::string modelPath2 = app_path + "/model/20260227_LSTP_TMini_v11.onnx";
+	std::string modelPath1 = app_path + "/model/20260331_LSTP_TMini_Original.onnx";
+	std::string modelPath2 = app_path + "/model/20260331_LSTP_TMini_Enhanced.onnx";
 	std::string labelsPath = app_path + "/INI/classes.txt";
 	YOLO11Detector original_detector(modelPath1, labelsPath, true);
 	YOLO11Detector updated_detector(modelPath2, labelsPath, true);
+
+	logMessage("Processing: " + DEBUG_BATCH_ROOT_DIR);
 
 	//Get list of sub directories given ROOT DIR.
 	auto jobDirectories = ListSubDirectories(DEBUG_BATCH_ROOT_DIR);
